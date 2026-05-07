@@ -200,6 +200,9 @@ class MainWindow(QMainWindow):
             )
 
     def _on_orchestrator_started(self, pipeline_id: int, stage: str) -> None:
+        self._terminal.append_turn_separator(
+            label=f"orchestrator · #{pipeline_id} {stage}"
+        )
         self._terminal.append_line(
             f"🤖 #{pipeline_id} {stage} 단계 자동 시작…", kind="info"
         )
