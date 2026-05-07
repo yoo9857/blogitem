@@ -143,19 +143,23 @@ class TestPublishFlow:
                 ch.publish(title="t", contents_html="<p>x</p>", image_paths=[])
         assert exc_info.value.retryable is True
 
-    def test_image_paths_warned_but_ignored(self) -> None:
-        """P3 미구현 — 이미지 첨부 요청해도 텍스트만 게시."""
+    def test_missing_image_propagates_filenotfound(self) -> None:
+        """P11 — 존재하지 않는 이미지 path 가 들어오면 BlogApi.upload_photo 가
+        FileNotFoundError 발생. NaverChannel 은 그대로 전파.
+        세부 테스트(업로드 + HTML 치환)는 test_naver_upload_photo.py 에서.
+        """
         ch = NaverChannel(
             oauth_client=_make_oauth_client(),
             token_store=_make_token_store(),
         )
         with respx.mock:
+            # uploadPhoto 호출 전에 FileNotFoundError 가 먼저 raise 됨
             respx.post(WRITE_POST_URL).mock(
                 return_value=Response(200, json={"result": {"logNo": "1"}})
             )
-            result = ch.publish(
-                title="t",
-                contents_html="<p>x</p>",
-                image_paths=[Path("nonexistent.png")],
-            )
-        assert result.external_id == "1"
+            with pytest.raises(FileNotFoundError):
+                ch.publish(
+                    title="t",
+                    contents_html="<p>x</p>",
+                    image_paths=[Path("nonexistent-image.png")],
+                )
