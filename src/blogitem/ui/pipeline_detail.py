@@ -1,8 +1,8 @@
-"""우측 파이프라인 상세 — 단계 카드 + 단계별 액션 버튼.
+"""우측 파이프라인 상세 — 단계 카드 + 단계별 액션 (전 단계 통합).
 
-P3 — TOPIC 단계만 액션 활성 ("주제 생성" Claude 호출).
-P3.5 — DRAFT/PUBLISH 액션 추가.
-P4 — IMAGE/HUMANIZE/CONFIRM 액션 추가 (업로드/diff/컨펌).
+자동 단계 (TOPIC/DRAFT/PUBLISH) — Claude 호출 버튼.
+반자동 단계 (IMAGE/HUMANIZE) — 업로드 다이얼로그.
+수동 단계 (CONFIRM) — 컨펌 다이얼로그 (DiffView).
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLayout,
     QMessageBox,
     QProgressDialog,
     QPushButton,
@@ -28,7 +29,7 @@ if TYPE_CHECKING:
     from blogitem.config import Settings
     from blogitem.pipeline.dto import PipelineDTO
     from blogitem.pipeline.service import PipelineService
-    from blogitem.ui.workers.claude_worker import ClaudeWorker
+    from blogitem.ui.workers.claude_worker import AutoStageWorker
 
 
 _STAGE_LABEL: dict[Stage, str] = {
@@ -40,11 +41,17 @@ _STAGE_LABEL: dict[Stage, str] = {
     Stage.PUBLISH: "6. 게시 (Claude + 네이버 · 자동)",
 }
 
+_AUTO_STAGE_BUTTON_LABEL: dict[Stage, str] = {
+    Stage.TOPIC: "주제 생성 (Claude)",
+    Stage.DRAFT: "초고 작성 (Claude)",
+    Stage.PUBLISH: "HTML 변환 + 게시 (Claude + 네이버)",
+}
+
 
 class PipelineDetailWidget(QWidget):
-    """선택 파이프라인의 단계 카드 + 액션."""
+    """선택 파이프라인의 단계 카드 + 액션 영역."""
 
-    pipeline_changed = Signal(int)  # 단계 변경 후 부모(MainWindow) 가 목록 refresh
+    pipeline_changed = Signal(int)
 
     def __init__(
         self,
@@ -57,7 +64,7 @@ class PipelineDetailWidget(QWidget):
         self._service = service
         self._settings = settings
         self._current_id: int | None = None
-        self._claude_worker: ClaudeWorker | None = None
+        self._claude_worker: AutoStageWorker | None = None
         self._progress: QProgressDialog | None = None
 
         self._title = QLabel("파이프라인을 선택하세요.", self)
@@ -65,12 +72,10 @@ class PipelineDetailWidget(QWidget):
             "font-size: 16px; font-weight: 600; padding: 12px;"
         )
 
-        # 액션 영역 — 단계별 버튼
         self._action_area = QWidget(self)
         self._action_layout = QHBoxLayout(self._action_area)
         self._action_layout.setContentsMargins(12, 0, 12, 8)
 
-        # 단계 카드 스택
         self._stages_container = QWidget(self)
         self._stages_layout = QVBoxLayout(self._stages_container)
         self._stages_layout.setContentsMargins(12, 0, 12, 12)
@@ -119,35 +124,61 @@ class PipelineDetailWidget(QWidget):
 
     def _update_action_area(self, dto: PipelineDTO) -> None:
         self._clear_layout(self._action_layout)
+        stage = dto.current_stage
+        status = dto.status
 
-        # 1단계 — TOPIC PENDING → Claude 호출 버튼
-        if dto.current_stage == Stage.TOPIC and dto.status == Status.PENDING:
-            btn = QPushButton("주제 생성 (Claude 호출)")
-            btn.clicked.connect(lambda: self._run_topic(dto.id))
+        if status == Status.RUNNING:
+            self._action_layout.addWidget(self._mk_label("⌛ 처리 중…", color="#c4623c"))
+
+        elif status == Status.FAILED:
+            self._action_layout.addWidget(
+                self._mk_label("⚠ 실패 — 단계 재시도는 P5 (재큐잉) 에서.", color="#c4623c")
+            )
+
+        elif status == Status.DONE:
+            self._action_layout.addWidget(self._mk_label("✓ 완료", color="#063"))
+
+        elif stage in _AUTO_STAGE_BUTTON_LABEL and status == Status.PENDING:
+            btn = QPushButton(_AUTO_STAGE_BUTTON_LABEL[stage])
+            btn.clicked.connect(
+                lambda checked=False, s=stage: self._run_auto_stage(dto.id, s)
+            )
             self._action_layout.addWidget(btn)
 
-        elif dto.current_stage == Stage.TOPIC and dto.status == Status.RUNNING:
-            lbl = QLabel("⌛ Claude 처리 중…")
-            lbl.setStyleSheet("color: #c4623c;")
-            self._action_layout.addWidget(lbl)
+        elif stage == Stage.IMAGE and status == Status.AWAITING_INPUT:
+            upload_btn = QPushButton("이미지 업로드…")
+            upload_btn.clicked.connect(lambda: self._upload_image(dto.id))
+            advance_btn = QPushButton("다음 단계로 →")
+            advance_btn.clicked.connect(lambda: self._advance_image(dto.id))
+            self._action_layout.addWidget(upload_btn)
+            self._action_layout.addWidget(advance_btn)
 
-        elif dto.status == Status.FAILED:
-            lbl = QLabel(f"⚠ 실패 — 재시도는 P3.5 에서 활성화 ({dto.current_stage.value})")
-            lbl.setStyleSheet("color: #c4623c;")
-            self._action_layout.addWidget(lbl)
+        elif stage == Stage.HUMANIZE and status == Status.AWAITING_INPUT:
+            btn = QPushButton("인간화 본문 업로드…")
+            btn.clicked.connect(lambda: self._upload_humanized(dto.id))
+            self._action_layout.addWidget(btn)
+
+        elif stage == Stage.CONFIRM and status == Status.AWAITING_REVIEW:
+            btn = QPushButton("컨펌 (DiffView)…")
+            btn.clicked.connect(lambda: self._open_confirm(dto.id))
+            self._action_layout.addWidget(btn)
+
+        elif status == Status.REJECTED:
+            self._action_layout.addWidget(
+                self._mk_label("거절됨 — 4단계로 회귀, 인간화 재업로드 필요.", color="#c4623c")
+            )
 
         else:
-            # 다른 단계의 액션은 P3.5/P4 에서.
-            hint = QLabel(f"({dto.current_stage.value} 단계 액션은 후속 P 에서 활성)")
-            hint.setStyleSheet("color: #7a756c; font-size: 11px;")
-            self._action_layout.addWidget(hint)
+            self._action_layout.addWidget(
+                self._mk_label(f"({stage.value}/{status.value})", color="#7a756c")
+            )
 
         self._action_layout.addStretch(1)
 
-    # ── Claude TOPIC 호출 ───────────────────────────────────────────────────
+    # ── 자동 단계 (Claude) ──────────────────────────────────────────────────
 
-    def _run_topic(self, pipeline_id: int) -> None:
-        from blogitem.ui.workers.claude_worker import ClaudeWorker
+    def _run_auto_stage(self, pipeline_id: int, stage: Stage) -> None:
+        from blogitem.ui.workers.claude_worker import AutoStageWorker
 
         self._progress = QProgressDialog(
             "Claude 호출 준비…",
@@ -156,36 +187,148 @@ class PipelineDetailWidget(QWidget):
             0,
             self,
         )
-        self._progress.setWindowTitle("주제 생성")
+        self._progress.setWindowTitle(_AUTO_STAGE_BUTTON_LABEL[stage])
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._progress.setMinimumDuration(0)
 
-        self._claude_worker = ClaudeWorker(
+        self._claude_worker = AutoStageWorker(
             pipeline_id=pipeline_id,
+            stage=stage,
             service=self._service,
-            artifacts_dir=self._settings.artifacts_dir,
-            model_primary=self._settings.claude_model_primary,
+            settings=self._settings,
         )
         self._claude_worker.progress.connect(self._progress.setLabelText)
-        self._claude_worker.finished_ok.connect(self._on_topic_ok)
-        self._claude_worker.failed.connect(self._on_topic_fail)
+        self._claude_worker.finished_ok.connect(self._on_auto_ok)
+        self._claude_worker.failed.connect(self._on_auto_fail)
         self._progress.canceled.connect(self._claude_worker.requestInterruption)
         self._claude_worker.finished.connect(self._progress.close)
 
         self._claude_worker.start()
         self._progress.exec()
 
-    def _on_topic_ok(self, pipeline_id: int, artifact_path: str) -> None:
+    def _on_auto_ok(self, pipeline_id: int, artifact_path: str) -> None:
         QMessageBox.information(
             self,
-            "주제 생성 완료",
-            f"커리큘럼이 저장되었습니다.\n경로: {artifact_path}",
+            "단계 완료",
+            f"산출물 저장: {artifact_path}",
         )
         self.show_pipeline(pipeline_id)
         self.pipeline_changed.emit(pipeline_id)
 
-    def _on_topic_fail(self, pipeline_id: int, message: str) -> None:
-        QMessageBox.critical(self, "주제 생성 실패", message)
+    def _on_auto_fail(self, pipeline_id: int, message: str) -> None:
+        QMessageBox.critical(self, "단계 실패", message)
+        self.show_pipeline(pipeline_id)
+        self.pipeline_changed.emit(pipeline_id)
+
+    # ── 이미지 업로드 (2단계) ──────────────────────────────────────────────
+
+    def _upload_image(self, pipeline_id: int) -> None:
+        from blogitem.pipeline.artifacts import ArtifactStore
+        from blogitem.ui.upload_dialog import ImageUploadDialog
+
+        dlg = ImageUploadDialog(parent=self)
+        if dlg.exec() != ImageUploadDialog.DialogCode.Accepted:
+            return
+        paths = dlg.selected_paths
+        if not paths:
+            return
+
+        store = ArtifactStore(self._settings.artifacts_dir)
+        errors: list[str] = []
+        ok_count = 0
+        for path in paths:
+            try:
+                self._service.ingest_image(
+                    pipeline_id, source_path=path, artifact_store=store
+                )
+                ok_count += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{path.name}: {type(e).__name__}: {e}")
+
+        msg = f"{ok_count}/{len(paths)} 이미지 등록"
+        if errors:
+            msg += "\n\n실패:\n" + "\n".join(errors)
+        QMessageBox.information(self, "이미지 업로드 결과", msg)
+
+        self.show_pipeline(pipeline_id)
+        self.pipeline_changed.emit(pipeline_id)
+
+    def _advance_image(self, pipeline_id: int) -> None:
+        try:
+            self._service.advance_image(pipeline_id)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "진행 불가", str(e))
+            return
+        self.show_pipeline(pipeline_id)
+        self.pipeline_changed.emit(pipeline_id)
+
+    # ── 인간화 텍스트 업로드 (4단계) ─────────────────────────────────────────
+
+    def _upload_humanized(self, pipeline_id: int) -> None:
+        from blogitem.pipeline.artifacts import ArtifactStore
+        from blogitem.ui.upload_dialog import TextUploadDialog
+
+        dlg = TextUploadDialog(
+            title="인간화 본문 업로드 (4단계)",
+            placeholder="ChatGPT 웹에서 인간화한 Markdown 본문을 붙여넣으세요.",
+            parent=self,
+        )
+        if dlg.exec() != TextUploadDialog.DialogCode.Accepted:
+            return
+
+        try:
+            self._service.ingest_humanized(
+                pipeline_id,
+                text=dlg.text,
+                artifact_store=ArtifactStore(self._settings.artifacts_dir),
+            )
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "업로드 실패", f"{type(e).__name__}: {e}")
+            return
+
+        self.show_pipeline(pipeline_id)
+        self.pipeline_changed.emit(pipeline_id)
+
+    # ── 컨펌 (5단계) ────────────────────────────────────────────────────────
+
+    def _open_confirm(self, pipeline_id: int) -> None:
+        from blogitem.pipeline.artifacts import ArtifactStore
+        from blogitem.ui.confirm_dialog import ConfirmDecision, ConfirmDialog
+
+        store = ArtifactStore(self._settings.artifacts_dir)
+        draft_text = self._service.read_latest_text_artifact(
+            pipeline_id, Stage.DRAFT, artifact_store=store
+        )
+        humanized_text = self._service.read_latest_text_artifact(
+            pipeline_id, Stage.HUMANIZE, artifact_store=store
+        )
+
+        if draft_text is None:
+            QMessageBox.critical(self, "본문 누락", "3단계 초고 산출물이 없습니다.")
+            return
+        if humanized_text is None:
+            QMessageBox.critical(self, "본문 누락", "4단계 인간화 산출물이 없습니다.")
+            return
+
+        dlg = ConfirmDialog(
+            draft_text=draft_text,
+            humanized_text=humanized_text,
+            parent=self,
+        )
+        if dlg.exec() != ConfirmDialog.DialogCode.Accepted:
+            return
+
+        try:
+            self._service.confirm_pipeline(
+                pipeline_id,
+                accept=(dlg.decision == ConfirmDecision.ACCEPT),
+                approver="user",
+                note=dlg.note,
+            )
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "컨펌 처리 실패", f"{type(e).__name__}: {e}")
+            return
+
         self.show_pipeline(pipeline_id)
         self.pipeline_changed.emit(pipeline_id)
 
@@ -212,10 +355,7 @@ class PipelineDetailWidget(QWidget):
         title = QLabel(_STAGE_LABEL[stage])
         title.setStyleSheet("font-weight: 600; font-size: 13px;")
         layout.addWidget(title)
-
-        hint = QLabel(
-            "▶ 진행 중" if is_current else "(대기)"
-        )
+        hint = QLabel("▶ 진행 중" if is_current else "(대기)")
         hint.setStyleSheet(
             f"color: {'#c4623c' if is_current else '#7a756c'}; font-size: 11px;"
         )
@@ -223,14 +363,16 @@ class PipelineDetailWidget(QWidget):
         layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         return card
 
-    # ── helper ──────────────────────────────────────────────────────────────
+    # ── helpers ─────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _clear_layout(layout: object) -> None:
-        from PySide6.QtWidgets import QLayout
+    def _mk_label(text: str, *, color: str = "#0a0908") -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(f"color: {color};")
+        return lbl
 
-        if not isinstance(layout, QLayout):
-            return
+    @staticmethod
+    def _clear_layout(layout: QLayout) -> None:
         while layout.count() > 0:
             item = layout.takeAt(0)
             if item is None:

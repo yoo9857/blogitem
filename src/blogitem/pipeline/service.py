@@ -1,11 +1,25 @@
-"""파이프라인 도메인 서비스 — Series/Pipeline CRUD + 자동 단계 실행."""
+"""파이프라인 도메인 서비스 — 전체 파이프라인 라이프사이클.
+
+자동 단계 (Claude 호출):
+    · run_topic_stage    — 1단계, 주제·커리큘럼 JSON
+    · run_draft_stage    — 3단계, 초고 Markdown
+    · run_publish_stage  — 6단계, HTML 변환 + 채널 게시
+
+수동 단계 (사람 입력 ingest):
+    · ingest_image       — 2단계, 이미지 업로드 (다중)
+    · ingest_humanized   — 4단계, 인간화 본문 업로드
+    · advance_image      — 2단계 → 3단계 (이미지 충분 시)
+    · confirm_pipeline   — 5단계 컨펌/거절 (REJECTED → HUMANIZE 회귀)
+"""
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 
 from blogitem.pipeline.dto import (
     ArtifactRecord,
@@ -13,7 +27,7 @@ from blogitem.pipeline.dto import (
     SeriesDTO,
     StageRunResult,
 )
-from blogitem.pipeline.models import Artifact, Pipeline, Series
+from blogitem.pipeline.models import Approval, Artifact, Pipeline, Series
 from blogitem.pipeline.stages import Stage, Status
 from blogitem.pipeline.state_machine import (
     INITIAL_STATUS,
@@ -27,6 +41,7 @@ if TYPE_CHECKING:
 
     from blogitem.ai.base import LlmClient
     from blogitem.ai.prompts import PromptLibrary
+    from blogitem.channels.base import PublishChannel
     from blogitem.pipeline.artifacts import ArtifactStore
 
 
@@ -40,18 +55,17 @@ def slugify(text: str) -> str:
 
 
 class PipelineService:
-    """시리즈/파이프라인 CRUD + 자동 단계 실행 (TOPIC/DRAFT/PUBLISH)."""
+    """파이프라인/시리즈 도메인 서비스."""
 
     def __init__(self, session_factory: sessionmaker[Session]) -> None:
         self._sf = session_factory
 
-    # ── 시리즈 / 파이프라인 생성 ─────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # 시리즈 / 파이프라인 생성 + 조회
+    # ─────────────────────────────────────────────────────────────────────
 
     def create_series_with_pipelines(
-        self,
-        *,
-        topic: str,
-        lecture_count: int,
+        self, *, topic: str, lecture_count: int
     ) -> SeriesDTO:
         topic = topic.strip()
         if not topic:
@@ -60,23 +74,22 @@ class PipelineService:
             raise ValueError("강의 수는 1~100 사이여야 합니다")
 
         slug_base = slugify(topic)
-
         with self._sf() as s:
             series = Series(topic=topic, status="active")
             s.add(series)
             s.flush()
 
             for i in range(1, lecture_count + 1):
-                p = Pipeline(
-                    series_id=series.id,
-                    position=i,
-                    slug=f"{slug_base}-{i:02d}",
-                    idempotency_key=f"series:{series.id}:lecture:{i}:v1",
-                    current_stage=Stage.TOPIC,
-                    status=Status.PENDING,
+                s.add(
+                    Pipeline(
+                        series_id=series.id,
+                        position=i,
+                        slug=f"{slug_base}-{i:02d}",
+                        idempotency_key=f"series:{series.id}:lecture:{i}:v1",
+                        current_stage=Stage.TOPIC,
+                        status=Status.PENDING,
+                    )
                 )
-                s.add(p)
-
             s.commit()
 
             return SeriesDTO(
@@ -88,10 +101,7 @@ class PipelineService:
             )
 
     def create_pipeline(
-        self,
-        *,
-        topic: str,
-        idempotency_key: str | None = None,
+        self, *, topic: str, idempotency_key: str | None = None
     ) -> PipelineDTO:
         topic = topic.strip()
         if not topic:
@@ -100,7 +110,7 @@ class PipelineService:
         key = idempotency_key or f"single:{slug}:v1"
 
         with self._sf() as s:
-            pipeline = Pipeline(
+            p = Pipeline(
                 series_id=None,
                 position=1,
                 slug=slug,
@@ -108,17 +118,13 @@ class PipelineService:
                 current_stage=Stage.TOPIC,
                 status=Status.PENDING,
             )
-            s.add(pipeline)
+            s.add(p)
             s.commit()
-
-            return self._to_pipeline_dto(pipeline, series_topic=None)
-
-    # ── 조회 ────────────────────────────────────────────────────────────────
+            return self._to_pipeline_dto(p, series_topic=None)
 
     def list_pipelines(self, *, limit: int = 200) -> list[PipelineDTO]:
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be 1~1000")
-
         with self._sf() as s:
             stmt = (
                 select(Pipeline, Series.topic)
@@ -163,7 +169,31 @@ class PipelineService:
             p, topic = row
             return self._to_pipeline_dto(p, series_topic=topic)
 
-    # ── 1단계: TOPIC (Claude 자동) ──────────────────────────────────────────
+    def read_latest_text_artifact(
+        self,
+        pipeline_id: int,
+        stage: Stage,
+        *,
+        artifact_store: ArtifactStore,
+    ) -> str | None:
+        """``{stage}`` 의 최근 ``kind=text`` 산출물 본문을 디스크에서 읽어 반환.
+
+        UI 가 디스크 트리를 직접 걷지 않도록 격리. DB 메타 → 절대 경로 → ``read_text``.
+        """
+        with self._sf() as s:
+            artifact = self._latest_artifact(s, pipeline_id, stage, "text")
+            rel_path = artifact.path if artifact else None
+
+        if rel_path is None:
+            return None
+        try:
+            return artifact_store.absolute_path(rel_path).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 1단계 — TOPIC (Claude 자동)
+    # ─────────────────────────────────────────────────────────────────────
 
     def run_topic_stage(
         self,
@@ -175,34 +205,16 @@ class PipelineService:
         lecture_count: int = 20,
         model: str | None = None,
     ) -> StageRunResult:
-        """1단계 — Claude 가 주제·커리큘럼 설계 → JSON 산출물 + IMAGE 단계로 전이.
-
-        흐름:
-            1. 검증: TOPIC + PENDING 상태 확인 → RUNNING 전이 (커밋).
-            2. LLM 호출 (세션 외부).
-            3. 산출물 디스크 저장.
-            4. Artifact 레코드 + IMAGE/AWAITING_INPUT 전이 (단일 트랜잭션).
-
-        실패 시 status=FAILED 로 마킹하고 ``StageRunResult(success=False)`` 반환.
-        """
-        topic_text = self._begin_topic_stage(pipeline_id)
+        topic_text = self._begin_auto_stage(pipeline_id, expected=Stage.TOPIC)
 
         try:
             system, user = prompt_lib.topic(
                 topic=topic_text, lecture_count=lecture_count
             )
             response = llm.complete(system=system, user=user, model=model)
-        except Exception as e:  # noqa: BLE001 — 모든 LLM 실패는 FAILED 로
+        except Exception as e:  # noqa: BLE001
             self._mark_stage_failed(pipeline_id, error=str(e))
-            return StageRunResult(
-                pipeline_id=pipeline_id,
-                stage=Stage.TOPIC,
-                success=False,
-                artifact_rel_path=None,
-                next_stage=None,
-                next_status=None,
-                error=f"{type(e).__name__}: {e}",
-            )
+            return _failed_result(pipeline_id, Stage.TOPIC, e)
 
         record = artifact_store.save_text(
             pipeline_id=pipeline_id,
@@ -210,7 +222,7 @@ class PipelineService:
             text=response.text,
             ext=".json",
         )
-        self._finish_topic_stage(pipeline_id, record=record)
+        self._finish_auto_stage(pipeline_id, stage=Stage.TOPIC, record=record)
 
         return StageRunResult(
             pipeline_id=pipeline_id,
@@ -224,41 +236,157 @@ class PipelineService:
             output_tokens=response.output_tokens,
         )
 
-    # ── private 전이 ────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────
+    # 2단계 — IMAGE (사용자 업로드)
+    # ─────────────────────────────────────────────────────────────────────
 
-    def _begin_topic_stage(self, pipeline_id: int) -> str:
-        """TOPIC 시작 — 검증 + RUNNING 전이. 시리즈/파이프라인 주제 텍스트 반환."""
+    def ingest_image(
+        self,
+        pipeline_id: int,
+        *,
+        source_path: Path,
+        artifact_store: ArtifactStore,
+    ) -> ArtifactRecord:
+        """사용자가 업로드한 이미지 1장을 IMAGE 단계 산출물로 등록.
+
+        다중 호출 가능 — 한 파이프라인에 N개 이미지. 단계 전이는 별도
+        ``advance_image`` 가 트리거.
+        """
+        self._assert_stage(pipeline_id, Stage.IMAGE, Status.AWAITING_INPUT)
+
+        record = artifact_store.save_image(
+            pipeline_id=pipeline_id,
+            stage=Stage.IMAGE,
+            source_path=source_path,
+        )
+
         with self._sf() as s:
-            pipeline = s.get(Pipeline, pipeline_id)
-            if pipeline is None:
-                raise ValueError(f"pipeline {pipeline_id} not found")
-            if Stage(pipeline.current_stage) != Stage.TOPIC:
-                raise InvalidTransitionError(
-                    f"current stage is {pipeline.current_stage}, expected TOPIC"
-                )
-            assert_transition(Status(pipeline.status), Status.RUNNING)
-
-            if pipeline.series_id:
-                series = s.get(Series, pipeline.series_id)
-                topic_text = series.topic if series else pipeline.slug
-            else:
-                topic_text = pipeline.slug
-
-            pipeline.status = Status.RUNNING
-            s.commit()
-            return topic_text
-
-    def _finish_topic_stage(self, pipeline_id: int, *, record: ArtifactRecord) -> None:
-        """TOPIC 성공 — Artifact 저장 + 다음 단계 전이."""
-        with self._sf() as s:
-            pipeline = s.get(Pipeline, pipeline_id)
-            if pipeline is None:
-                raise ValueError(f"pipeline {pipeline_id} disappeared")
-
             s.add(
                 Artifact(
                     pipeline_id=pipeline_id,
-                    stage=Stage.TOPIC,
+                    stage=Stage.IMAGE,
+                    kind="image",
+                    path=record.rel_path,
+                    sha256=record.sha256,
+                    size=record.size,
+                    mime=record.mime,
+                )
+            )
+            s.commit()
+        return record
+
+    def advance_image(self, pipeline_id: int) -> None:
+        """IMAGE → DRAFT 전이. 이미지 1개 이상 업로드되어 있어야 함."""
+        with self._sf() as s:
+            p = self._fetch_pipeline_or_raise(s, pipeline_id)
+            if Stage(p.current_stage) != Stage.IMAGE:
+                raise InvalidTransitionError(
+                    f"current stage is {p.current_stage}, expected IMAGE"
+                )
+            if Status(p.status) != Status.AWAITING_INPUT:
+                raise InvalidTransitionError(
+                    f"current status is {p.status}, expected AWAITING_INPUT"
+                )
+
+            count = s.scalar(
+                select(func.count(Artifact.id)).where(
+                    Artifact.pipeline_id == pipeline_id,
+                    Artifact.stage == Stage.IMAGE,
+                )
+            )
+            if not count:
+                raise ValueError("이미지를 1개 이상 업로드해야 다음 단계로 진행 가능")
+
+            assert_transition(Status.AWAITING_INPUT, Status.DONE)
+            nxt = next_stage(Stage.IMAGE)
+            assert nxt is not None
+            p.current_stage = nxt
+            p.status = INITIAL_STATUS[nxt]
+            s.commit()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 3단계 — DRAFT (Claude 자동)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def run_draft_stage(
+        self,
+        pipeline_id: int,
+        *,
+        llm: LlmClient,
+        prompt_lib: PromptLibrary,
+        artifact_store: ArtifactStore,
+        model: str | None = None,
+    ) -> StageRunResult:
+        """3단계 — Claude 가 초고 Markdown 작성. TOPIC 산출물 + 이미지 메타 사용."""
+        self._begin_auto_stage(pipeline_id, expected=Stage.DRAFT)
+
+        # 입력 자료 수집 — RUNNING 전이 후 별도 세션에서
+        try:
+            series_topic, lecture_meta, image_descriptions = self._gather_draft_inputs(
+                pipeline_id, artifact_store
+            )
+        except Exception as e:  # noqa: BLE001
+            self._mark_stage_failed(pipeline_id, error=str(e))
+            return _failed_result(pipeline_id, Stage.DRAFT, e)
+
+        try:
+            system, user = prompt_lib.draft(
+                series_topic=series_topic,
+                lecture_meta=lecture_meta,
+                image_descriptions=image_descriptions,
+            )
+            response = llm.complete(system=system, user=user, model=model)
+        except Exception as e:  # noqa: BLE001
+            self._mark_stage_failed(pipeline_id, error=str(e))
+            return _failed_result(pipeline_id, Stage.DRAFT, e)
+
+        record = artifact_store.save_text(
+            pipeline_id=pipeline_id,
+            stage=Stage.DRAFT,
+            text=response.text,
+            ext=".md",
+        )
+        self._finish_auto_stage(pipeline_id, stage=Stage.DRAFT, record=record)
+
+        return StageRunResult(
+            pipeline_id=pipeline_id,
+            stage=Stage.DRAFT,
+            success=True,
+            artifact_rel_path=record.rel_path,
+            next_stage=Stage.HUMANIZE,
+            next_status=Status.AWAITING_INPUT,
+            error=None,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 4단계 — HUMANIZE (사용자 업로드)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def ingest_humanized(
+        self,
+        pipeline_id: int,
+        *,
+        text: str,
+        artifact_store: ArtifactStore,
+    ) -> ArtifactRecord:
+        """ChatGPT 웹에서 인간화한 본문(Markdown 권장)을 4단계 산출물로 등록 + CONFIRM 전이."""
+        if not text.strip():
+            raise ValueError("본문이 비어있습니다")
+        self._assert_stage(pipeline_id, Stage.HUMANIZE, Status.AWAITING_INPUT)
+
+        record = artifact_store.save_text(
+            pipeline_id=pipeline_id,
+            stage=Stage.HUMANIZE,
+            text=text,
+            ext=".md",
+        )
+        with self._sf() as s:
+            s.add(
+                Artifact(
+                    pipeline_id=pipeline_id,
+                    stage=Stage.HUMANIZE,
                     kind="text",
                     path=record.rel_path,
                     sha256=record.sha256,
@@ -266,24 +394,376 @@ class PipelineService:
                     mime=record.mime,
                 )
             )
+            # HUMANIZE 완료 → CONFIRM/AWAITING_REVIEW
+            p = s.get(Pipeline, pipeline_id)
+            assert p is not None
+            nxt = next_stage(Stage.HUMANIZE)
+            assert nxt is not None
+            p.current_stage = nxt
+            p.status = INITIAL_STATUS[nxt]
+            s.commit()
+        return record
 
-            nxt = next_stage(Stage.TOPIC)
-            if nxt is None:
-                pipeline.status = Status.DONE
+    # ─────────────────────────────────────────────────────────────────────
+    # 5단계 — CONFIRM (사람 게이트)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def confirm_pipeline(
+        self,
+        pipeline_id: int,
+        *,
+        accept: bool,
+        approver: str | None = None,
+        note: str | None = None,
+    ) -> None:
+        """5단계 컨펌. accept=True → PUBLISH 진입. False → HUMANIZE/AWAITING_INPUT 회귀."""
+        self._assert_stage(pipeline_id, Stage.CONFIRM, Status.AWAITING_REVIEW)
+
+        with self._sf() as s:
+            s.add(
+                Approval(
+                    pipeline_id=pipeline_id,
+                    stage=Stage.CONFIRM,
+                    decision="accept" if accept else "reject",
+                    approver=approver,
+                    note=note,
+                )
+            )
+            p = s.get(Pipeline, pipeline_id)
+            assert p is not None
+
+            if accept:
+                nxt = next_stage(Stage.CONFIRM)
+                assert nxt is not None  # PUBLISH
+                p.current_stage = nxt
+                p.status = INITIAL_STATUS[nxt]
             else:
-                pipeline.current_stage = nxt
-                pipeline.status = INITIAL_STATUS[nxt]
+                # 거절 — HUMANIZE 단계로 돌아가서 재업로드 대기
+                p.current_stage = Stage.HUMANIZE
+                p.status = Status.AWAITING_INPUT
+            s.commit()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 6단계 — PUBLISH (Claude HTML 변환 + 채널 게시)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def run_publish_stage(
+        self,
+        pipeline_id: int,
+        *,
+        llm: LlmClient,
+        prompt_lib: PromptLibrary,
+        artifact_store: ArtifactStore,
+        channel: PublishChannel,
+        model: str | None = None,
+    ) -> StageRunResult:
+        """6단계 — HUMANIZE 산출물(MD) → Claude HTML 변환 → 채널 게시 → DONE."""
+        self._begin_auto_stage(pipeline_id, expected=Stage.PUBLISH)
+
+        try:
+            title, humanized_md, image_paths = self._gather_publish_inputs(
+                pipeline_id, artifact_store
+            )
+        except Exception as e:  # noqa: BLE001
+            self._mark_stage_failed(pipeline_id, error=str(e))
+            return _failed_result(pipeline_id, Stage.PUBLISH, e)
+
+        # HTML 변환
+        try:
+            sys_p, usr_p = prompt_lib.publish(
+                humanized_markdown=humanized_md,
+                image_paths=[str(p) for p in image_paths],
+            )
+            response = llm.complete(system=sys_p, user=usr_p, model=model)
+        except Exception as e:  # noqa: BLE001
+            self._mark_stage_failed(pipeline_id, error=str(e))
+            return _failed_result(pipeline_id, Stage.PUBLISH, e)
+
+        html_record = artifact_store.save_text(
+            pipeline_id=pipeline_id,
+            stage=Stage.PUBLISH,
+            text=response.text,
+            ext=".html",
+        )
+
+        # 채널 게시
+        try:
+            publish_result = channel.publish(
+                title=title,
+                contents_html=response.text,
+                image_paths=image_paths,
+            )
+        except Exception as e:  # noqa: BLE001
+            # HTML artifact 는 이미 저장 — 다시 호출 시 재사용 가능 (멱등성)
+            self._mark_stage_failed(pipeline_id, error=str(e))
+            return _failed_result(pipeline_id, Stage.PUBLISH, e)
+
+        # DB Artifact + DONE 전이 + 게시 메타 기록
+        with self._sf() as s:
+            s.add(
+                Artifact(
+                    pipeline_id=pipeline_id,
+                    stage=Stage.PUBLISH,
+                    kind="text",
+                    path=html_record.rel_path,
+                    sha256=html_record.sha256,
+                    size=html_record.size,
+                    mime=html_record.mime,
+                )
+            )
+            # 게시 결과를 Approval 비슷한 형태로 기록 (별도 테이블 만들기엔 작아서 note 활용)
+            s.add(
+                Approval(
+                    pipeline_id=pipeline_id,
+                    stage=Stage.PUBLISH,
+                    decision="accept",
+                    approver=f"channel:{publish_result.channel}",
+                    note=f"external_id={publish_result.external_id}; url={publish_result.url or ''}",
+                )
+            )
+            p = s.get(Pipeline, pipeline_id)
+            assert p is not None
+            p.status = Status.DONE
+            s.commit()
+
+        return StageRunResult(
+            pipeline_id=pipeline_id,
+            stage=Stage.PUBLISH,
+            success=True,
+            artifact_rel_path=html_record.rel_path,
+            next_stage=None,
+            next_status=Status.DONE,
+            error=None,
+            input_tokens=response.input_tokens,
+            output_tokens=response.output_tokens,
+        )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 단계 전이 헬퍼 (private)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _begin_auto_stage(self, pipeline_id: int, *, expected: Stage) -> str:
+        """자동 단계 시작 — 검증 + RUNNING 전이. 시리즈 주제 텍스트 반환 (TOPIC 용)."""
+        with self._sf() as s:
+            p = self._fetch_pipeline_or_raise(s, pipeline_id)
+            if Stage(p.current_stage) != expected:
+                raise InvalidTransitionError(
+                    f"current stage is {p.current_stage}, expected {expected.value}"
+                )
+            assert_transition(Status(p.status), Status.RUNNING)
+
+            if p.series_id:
+                series = s.get(Series, p.series_id)
+                topic_text = series.topic if series else p.slug
+            else:
+                topic_text = p.slug
+
+            p.status = Status.RUNNING
+            s.commit()
+            return topic_text
+
+    def _finish_auto_stage(
+        self, pipeline_id: int, *, stage: Stage, record: ArtifactRecord
+    ) -> None:
+        """자동 단계 성공 — Artifact 저장 + 다음 단계 전이."""
+        with self._sf() as s:
+            p = self._fetch_pipeline_or_raise(s, pipeline_id)
+            s.add(
+                Artifact(
+                    pipeline_id=pipeline_id,
+                    stage=stage,
+                    kind="text",
+                    path=record.rel_path,
+                    sha256=record.sha256,
+                    size=record.size,
+                    mime=record.mime,
+                )
+            )
+            nxt = next_stage(stage)
+            if nxt is None:
+                p.status = Status.DONE
+            else:
+                p.current_stage = nxt
+                p.status = INITIAL_STATUS[nxt]
             s.commit()
 
     def _mark_stage_failed(self, pipeline_id: int, *, error: str) -> None:
         with self._sf() as s:
-            pipeline = s.get(Pipeline, pipeline_id)
-            if pipeline is None:
+            p = s.get(Pipeline, pipeline_id)
+            if p is None:
                 return
-            pipeline.status = Status.FAILED
+            p.status = Status.FAILED
             s.commit()
 
-    # ── DTO 변환 ────────────────────────────────────────────────────────────
+    def _assert_stage(self, pipeline_id: int, stage: Stage, status: Status) -> None:
+        with self._sf() as s:
+            p = self._fetch_pipeline_or_raise(s, pipeline_id)
+            if Stage(p.current_stage) != stage:
+                raise InvalidTransitionError(
+                    f"current stage is {p.current_stage}, expected {stage.value}"
+                )
+            if Status(p.status) != status:
+                raise InvalidTransitionError(
+                    f"current status is {p.status}, expected {status.value}"
+                )
+
+    @staticmethod
+    def _fetch_pipeline_or_raise(s: Session, pipeline_id: int) -> Pipeline:
+        p = s.get(Pipeline, pipeline_id)
+        if p is None:
+            raise ValueError(f"pipeline {pipeline_id} not found")
+        return p
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 입력 수집 헬퍼
+    # ─────────────────────────────────────────────────────────────────────
+
+    def _gather_draft_inputs(
+        self,
+        pipeline_id: int,
+        artifact_store: ArtifactStore,
+    ) -> tuple[str, dict[str, object], list[str]]:
+        """DRAFT 단계 입력 수집 — 시리즈 주제, 이번 강의 메타, 이미지 설명.
+
+        Returns:
+            (series_topic, lecture_meta_dict, image_descriptions)
+        """
+        with self._sf() as s:
+            stmt = (
+                select(Pipeline, Series.topic)
+                .outerjoin(Series, Pipeline.series_id == Series.id)
+                .where(Pipeline.id == pipeline_id)
+            )
+            row = s.execute(stmt).first()
+            if row is None:
+                raise ValueError(f"pipeline {pipeline_id} not found")
+            p, series_topic = row
+            position = int(p.position)
+
+            topic_artifact = self._latest_artifact(s, pipeline_id, Stage.TOPIC, "text")
+            if topic_artifact is None:
+                raise RuntimeError("TOPIC 산출물(커리큘럼 JSON)이 없음 — 1단계 먼저 실행 필요")
+
+            image_artifacts = (
+                s.execute(
+                    select(Artifact)
+                    .where(
+                        Artifact.pipeline_id == pipeline_id,
+                        Artifact.stage == Stage.IMAGE,
+                        Artifact.kind == "image",
+                    )
+                    .order_by(Artifact.id.asc())
+                )
+                .scalars()
+                .all()
+            )
+
+        # 세션 외부에서 디스크 읽기
+        topic_path = artifact_store.absolute_path(topic_artifact.path)
+        try:
+            curriculum = json.loads(topic_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"커리큘럼 JSON 파싱 실패: {e}") from e
+
+        lectures = curriculum.get("lectures") or []
+        # position 은 1-based, 배열은 0-based
+        idx = position - 1
+        if idx < 0 or idx >= len(lectures):
+            raise RuntimeError(
+                f"커리큘럼에 position={position} 강의 메타 없음 (총 {len(lectures)}개)"
+            )
+        lecture_meta = lectures[idx]
+        if not isinstance(lecture_meta, dict):
+            raise RuntimeError(f"lecture meta 가 객체가 아님: {type(lecture_meta).__name__}")
+
+        # 이미지 파일명을 임시 설명으로 사용 (P4 에서 사용자가 alt-text 입력 가능)
+        image_descriptions = [
+            f"[이미지] {Path(a.path).name}" for a in image_artifacts
+        ]
+
+        return (
+            str(series_topic or curriculum.get("series_title", "")),
+            lecture_meta,
+            image_descriptions,
+        )
+
+    def _gather_publish_inputs(
+        self,
+        pipeline_id: int,
+        artifact_store: ArtifactStore,
+    ) -> tuple[str, str, list[Path]]:
+        """PUBLISH 단계 입력 — title, humanized markdown, 절대 이미지 경로 리스트."""
+        with self._sf() as s:
+            p = self._fetch_pipeline_or_raise(s, pipeline_id)
+            position = int(p.position)
+
+            humanize_artifact = self._latest_artifact(s, pipeline_id, Stage.HUMANIZE, "text")
+            if humanize_artifact is None:
+                raise RuntimeError("HUMANIZE 산출물(인간화 본문)이 없음")
+
+            topic_artifact = self._latest_artifact(s, pipeline_id, Stage.TOPIC, "text")
+            if topic_artifact is None:
+                raise RuntimeError("TOPIC 산출물이 없음 — title 추출 불가")
+
+            image_artifacts = (
+                s.execute(
+                    select(Artifact)
+                    .where(
+                        Artifact.pipeline_id == pipeline_id,
+                        Artifact.stage == Stage.IMAGE,
+                    )
+                    .order_by(Artifact.id.asc())
+                )
+                .scalars()
+                .all()
+            )
+            image_paths = [
+                artifact_store.absolute_path(a.path) for a in image_artifacts
+            ]
+
+        humanized_md = (
+            artifact_store.absolute_path(humanize_artifact.path)
+            .read_text(encoding="utf-8")
+        )
+
+        topic_text = (
+            artifact_store.absolute_path(topic_artifact.path)
+            .read_text(encoding="utf-8")
+        )
+        try:
+            curriculum = json.loads(topic_text)
+            lectures = curriculum.get("lectures") or []
+            idx = position - 1
+            title = lectures[idx].get("title") if 0 <= idx < len(lectures) else None
+        except (json.JSONDecodeError, AttributeError, TypeError):
+            title = None
+
+        if not title:
+            # 폴백 — 슬러그
+            with self._sf() as s:
+                p = self._fetch_pipeline_or_raise(s, pipeline_id)
+                title = p.slug
+
+        return title, humanized_md, image_paths
+
+    @staticmethod
+    def _latest_artifact(
+        s: Session, pipeline_id: int, stage: Stage, kind: str
+    ) -> Artifact | None:
+        return s.execute(
+            select(Artifact)
+            .where(
+                Artifact.pipeline_id == pipeline_id,
+                Artifact.stage == stage,
+                Artifact.kind == kind,
+            )
+            .order_by(desc(Artifact.id))
+            .limit(1)
+        ).scalar_one_or_none()
+
+    # ─────────────────────────────────────────────────────────────────────
+    # DTO 변환
+    # ─────────────────────────────────────────────────────────────────────
 
     @staticmethod
     def _to_pipeline_dto(p: Pipeline, *, series_topic: str | None) -> PipelineDTO:
@@ -298,3 +778,18 @@ class PipelineService:
             created_at=p.created_at,
             updated_at=p.updated_at,
         )
+
+
+# ── 결과 빌더 ──────────────────────────────────────────────────────────────────
+
+
+def _failed_result(pipeline_id: int, stage: Stage, error: BaseException) -> StageRunResult:
+    return StageRunResult(
+        pipeline_id=pipeline_id,
+        stage=stage,
+        success=False,
+        artifact_rel_path=None,
+        next_stage=None,
+        next_status=None,
+        error=f"{type(error).__name__}: {error}",
+    )
