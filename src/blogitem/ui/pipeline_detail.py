@@ -113,7 +113,7 @@ class PipelineDetailWidget(QWidget):
         )
 
         self._update_action_area(dto)
-        self._render_stage_cards(dto.current_stage)
+        self._render_stage_cards(dto)
 
     def clear(self) -> None:
         self._current_id = None
@@ -445,33 +445,42 @@ class PipelineDetailWidget(QWidget):
 
     # ── 단계 카드 렌더 ──────────────────────────────────────────────────────
 
-    def _render_stage_cards(self, current: Stage) -> None:
+    def _render_stage_cards(self, dto: PipelineDTO) -> None:
+        from blogitem.pipeline.artifacts import ArtifactStore
+        from blogitem.ui.stage_card import StageCard
+
         self._clear_layout(self._stages_layout)
+
+        # 산출물 일괄 로드 + 단계별 그룹핑
+        store = ArtifactStore(self._settings.artifacts_dir)
+        try:
+            summaries = self._service.list_artifact_summaries(
+                dto.id, artifact_store=store
+            )
+        except Exception:  # noqa: BLE001
+            summaries = []
+
+        by_stage: dict[Stage, list] = {st: [] for st in Stage}
+        for s in summaries:
+            by_stage.setdefault(s.stage, []).append(s)
+
         for stage in Stage:
-            self._stages_layout.addWidget(self._make_stage_card(stage, current))
+            card = StageCard(
+                stage=stage,
+                is_current=(stage == dto.current_stage),
+                current_status=dto.status,
+                artifacts=by_stage.get(stage, []),
+                parent=self._stages_container,
+            )
+            card.artifact_clicked.connect(self._open_artifact_viewer)
+            self._stages_layout.addWidget(card)
         self._stages_layout.addStretch(1)
 
-    @staticmethod
-    def _make_stage_card(stage: Stage, current: Stage) -> QFrame:
-        card = QFrame()
-        card.setFrameShape(QFrame.Shape.StyledPanel)
-        is_current = stage == current
-        card.setStyleSheet(
-            "QFrame { padding: 10px 12px; "
-            f"border: 1px solid {'#c4623c' if is_current else '#d9d0bc'}; "
-            f"border-radius: 4px; "
-            f"background: {'#fcf0e9' if is_current else '#ffffff'}; }}"
-        )
-        layout = QVBoxLayout(card)
-        title = QLabel(_STAGE_LABEL[stage])
-        title.setStyleSheet("font-weight: 600; font-size: 13px;")
-        layout.addWidget(title)
-        hint = QLabel("▶ 진행 중" if is_current else "(대기)")
-        hint.setStyleSheet(
-            f"color: {'#c4623c' if is_current else '#7a756c'}; font-size: 11px;"
-        )
-        layout.addWidget(hint)
-        layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+    def _open_artifact_viewer(self, artifact: object) -> None:
+        from blogitem.ui.artifact_viewer_dialog import ArtifactViewerDialog
+
+        dlg = ArtifactViewerDialog(artifact=artifact, parent=self)  # type: ignore[arg-type]
+        dlg.exec()
         return card
 
     # ── helpers ─────────────────────────────────────────────────────────────

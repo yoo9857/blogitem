@@ -23,6 +23,7 @@ from sqlalchemy import desc, func, select
 
 from blogitem.pipeline.dto import (
     ArtifactRecord,
+    ArtifactSummary,
     PipelineDTO,
     SeriesDTO,
     StageRunResult,
@@ -168,6 +169,66 @@ class PipelineService:
                 return None
             p, topic = row
             return self._to_pipeline_dto(p, series_topic=topic)
+
+    def list_artifact_summaries(
+        self,
+        pipeline_id: int,
+        *,
+        artifact_store: ArtifactStore,
+        preview_chars: int = 240,
+    ) -> list[ArtifactSummary]:
+        """파이프라인의 모든 산출물 메타 + 미리보기 (UI 카드용).
+
+        텍스트/JSON 은 첫 ``preview_chars`` 만 디스크에서 읽고 나머지는 잘라냄
+        (성능 + 메모리). 이미지는 ``preview_text=None``.
+        """
+        from blogitem.log import get_logger
+
+        log = get_logger(__name__)
+        with self._sf() as s:
+            rows = (
+                s.execute(
+                    select(Artifact)
+                    .where(Artifact.pipeline_id == pipeline_id)
+                    .order_by(Artifact.id.asc())
+                )
+                .scalars()
+                .all()
+            )
+
+        results: list[ArtifactSummary] = []
+        for a in rows:
+            abs_path = artifact_store.absolute_path(a.path)
+            preview_text: str | None = None
+            truncated = False
+            if a.kind in ("text", "image_prompts"):
+                try:
+                    full = abs_path.read_text(encoding="utf-8")
+                    truncated = len(full) > preview_chars
+                    preview_text = full[:preview_chars]
+                except (OSError, UnicodeDecodeError) as e:
+                    log.warning(
+                        "artifact.preview_failed",
+                        artifact_id=a.id,
+                        err=f"{type(e).__name__}: {e}",
+                    )
+            results.append(
+                ArtifactSummary(
+                    id=a.id,
+                    pipeline_id=a.pipeline_id,
+                    stage=Stage(a.stage),
+                    kind=a.kind,
+                    rel_path=a.path,
+                    abs_path=abs_path,
+                    sha256=a.sha256,
+                    size=a.size,
+                    mime=a.mime,
+                    created_at=a.created_at,
+                    preview_text=preview_text,
+                    is_text_truncated=truncated,
+                )
+            )
+        return results
 
     def read_latest_text_artifact(
         self,
