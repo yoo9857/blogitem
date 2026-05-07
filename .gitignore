@@ -1,30 +1,67 @@
 # ============================================================================
-# blogitem — 민감 자산 / 런타임 산출물 / IDE 설정 제외
+# blogitem — Python 데스크톱 앱
 # ============================================================================
 
-# Credentials & OAuth 토큰 — 절대 커밋 금지
-/config.php
-/tokens/*
-!/tokens/.htaccess
-!/tokens/.gitkeep
-
-# Runtime
-/logs/*
-!/logs/.htaccess
-!/logs/.gitkeep
-/tmp/
-*.lock
-
-# Dependencies
-/vendor/
-composer.lock
-
-# Environment
+# 시크릿 / 환경
 .env
 .env.local
 .env.*.local
 
-# IDE / Editor
+# 런타임 / 데이터 (사용자 PC 한정)
+/data/
+/tokens/*
+!/tokens/.gitkeep
+/logs/*
+!/logs/.gitkeep
+
+# Python 빌드 / 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+wheels/
+share/python-wheels/
+MANIFEST
+
+# 가상환경
+.venv/
+venv/
+env/
+ENV/
+.python-version.local
+
+# uv
+.uv-cache/
+
+# 테스트 / 커버리지
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.cache/
+
+# 타입체크 / 린트 캐시
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# PyInstaller 빌드 산출물
+/dist/
+/build/
+*.spec.bak
+
+# IDE
 .vscode/
 .idea/
 *.iml
@@ -37,11 +74,13 @@ composer.lock
 Thumbs.db
 desktop.ini
 
-# PHP cache
-.phpunit.cache/
-.phpunit.result.cache
-.php-cs-fixer.cache
+# Qt 컴파일 산출물
+*.qm
+ui_*.py
+*_rc.py
 
-# Build / temp
-*.bak
-*.tmp
+# DB
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3

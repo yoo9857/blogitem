@@ -1,0 +1,51 @@
+# ============================================================================
+# ruff — lint + format 통합
+# ============================================================================
+# 명령:
+#   uv run ruff check .            # 린트
+#   uv run ruff check . --fix      # 자동 수정
+#   uv run ruff format .           # 포맷
+# ----------------------------------------------------------------------------
+
+target-version = "py311"
+line-length = 100
+extend-exclude = ["migrations/versions", "build", "dist"]
+
+[lint]
+# 합리적 기본 + 도메인 특화 추가
+select = [
+    "E",     # pycodestyle errors
+    "W",     # pycodestyle warnings
+    "F",     # pyflakes
+    "I",     # isort
+    "B",     # flake8-bugbear
+    "C4",    # flake8-comprehensions
+    "UP",    # pyupgrade — 모던 syntax
+    "N",     # pep8-naming
+    "S",     # flake8-bandit (보안)
+    "A",     # flake8-builtins (shadowing)
+    "RET",   # flake8-return
+    "SIM",   # flake8-simplify
+    "TCH",   # flake8-type-checking
+    "PTH",   # flake8-use-pathlib
+    "RUF",   # ruff-specific
+]
+ignore = [
+    "E501",  # line-too-long — formatter 가 처리
+    "S101",  # assert — 테스트에서 자유롭게
+    "S105",  # hardcoded password — keyring 키 이름 등
+    "S106",  # hardcoded password func arg
+]
+
+[lint.per-file-ignores]
+"tests/**/*.py" = ["S", "B"]              # 테스트는 보안·버그 룰 완화
+"src/blogitem/ui/**/*.py" = ["N802"]      # PySide6 시그널/슬롯은 camelCase 허용
+
+[lint.isort]
+known-first-party = ["blogitem"]
+combine-as-imports = true
+
+[format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
