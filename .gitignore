@@ -1,0 +1,47 @@
+# ============================================================================
+# blogitem — 민감 자산 / 런타임 산출물 / IDE 설정 제외
+# ============================================================================
+
+# Credentials & OAuth 토큰 — 절대 커밋 금지
+/config.php
+/tokens/*
+!/tokens/.htaccess
+!/tokens/.gitkeep
+
+# Runtime
+/logs/*
+!/logs/.htaccess
+!/logs/.gitkeep
+/tmp/
+*.lock
+
+# Dependencies
+/vendor/
+composer.lock
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE / Editor
+.vscode/
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# PHP cache
+.phpunit.cache/
+.phpunit.result.cache
+.php-cs-fixer.cache
+
+# Build / temp
+*.bak
+*.tmp
