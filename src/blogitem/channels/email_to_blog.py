@@ -90,12 +90,35 @@ class EmailToBlogChannel(PublishChannel):
 
         try:
             self._send(msg)
-        except (smtplib.SMTPException, OSError) as e:
-            retryable = isinstance(e, (smtplib.SMTPServerDisconnected, OSError))
+        except smtplib.SMTPException as e:
+            # SMTPException 은 OSError 상속이라 isinstance(e, OSError) 가 True 임 — 주의.
+            # SMTP 의미별 분기를 먼저: 인증/수신/송신/데이터/HELO 실패는 영구 (재시도 무의미),
+            # 연결 끊김만 재시도 가능. 나머지 SMTPException 은 보수적으로 영구.
+            permanent_smtp = (
+                smtplib.SMTPAuthenticationError,
+                smtplib.SMTPRecipientsRefused,
+                smtplib.SMTPSenderRefused,
+                smtplib.SMTPDataError,
+                smtplib.SMTPHeloError,
+                smtplib.SMTPNotSupportedError,
+            )
+            if isinstance(e, smtplib.SMTPServerDisconnected):
+                retryable = True
+            elif isinstance(e, permanent_smtp):
+                retryable = False
+            else:
+                retryable = False
             raise PublishError(
                 f"SMTP {type(e).__name__}: {e}",
                 channel=self.name,
                 retryable=retryable,
+            ) from e
+        except OSError as e:
+            # 순수 네트워크/소켓 오류 (DNS, 연결 불가 등) — 재시도 가능
+            raise PublishError(
+                f"SMTP {type(e).__name__}: {e}",
+                channel=self.name,
+                retryable=True,
             ) from e
 
         return PublishResult(channel=self.name, external_id=message_id)
