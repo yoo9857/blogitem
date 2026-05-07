@@ -253,7 +253,7 @@ class PipelineService:
             return None
 
     # ─────────────────────────────────────────────────────────────────────
-    # 1단계 — TOPIC (Claude 자동)
+    # 1단계 — TOPIC (시리즈-레벨 커리큘럼 — 첫 호출만 Claude, 이후 재사용)
     # ─────────────────────────────────────────────────────────────────────
 
     def run_topic_stage(
@@ -267,8 +267,41 @@ class PipelineService:
         model: str | None = None,
         on_line: object = None,
     ) -> StageRunResult:
+        """시리즈 커리큘럼을 1회만 생성하고 모든 강의 파이프라인이 공유.
+
+        흐름:
+            1. 시리즈가 ``outline`` 을 이미 가지고 있으면 → Claude 호출 X.
+               기존 outline 을 이 파이프라인의 TOPIC artifact 로 복사 + 다음 단계 전이.
+            2. 없으면 Claude 호출 → 응답을 ``Series.outline`` + 이 파이프라인 artifact
+               양쪽에 저장 (다음 강의들이 재사용).
+            3. 시리즈 없는 단일 파이프라인은 항상 Claude 호출 (공유 대상 없음).
+        """
         topic_text = self._begin_auto_stage(pipeline_id, expected=Stage.TOPIC)
 
+        # 시리즈 outline 재사용 가능 여부 검사
+        existing_outline = self._existing_series_outline(pipeline_id)
+        if existing_outline is not None:
+            # 캐시 히트 — Claude 호출 없이 즉시 산출물 저장
+            record = artifact_store.save_text(
+                pipeline_id=pipeline_id,
+                stage=Stage.TOPIC,
+                text=existing_outline,
+                ext=".json",
+            )
+            self._finish_auto_stage(pipeline_id, stage=Stage.TOPIC, record=record)
+            return StageRunResult(
+                pipeline_id=pipeline_id,
+                stage=Stage.TOPIC,
+                success=True,
+                artifact_rel_path=record.rel_path,
+                next_stage=Stage.IMAGE,
+                next_status=Status.AWAITING_INPUT,
+                error=None,
+                input_tokens=0,
+                output_tokens=0,
+            )
+
+        # 캐시 미스 — Claude 호출
         try:
             system, user = prompt_lib.topic(
                 topic=topic_text, lecture_count=lecture_count
@@ -279,6 +312,9 @@ class PipelineService:
         except Exception as e:  # noqa: BLE001
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.TOPIC, e)
+
+        # Series.outline 에 저장 (있을 때만 — 다음 강의들이 공유)
+        self._save_series_outline(pipeline_id, response.text)
 
         record = artifact_store.save_text(
             pipeline_id=pipeline_id,
@@ -299,6 +335,30 @@ class PipelineService:
             input_tokens=response.input_tokens,
             output_tokens=response.output_tokens,
         )
+
+    def _existing_series_outline(self, pipeline_id: int) -> str | None:
+        """파이프라인이 속한 시리즈에 이미 저장된 ``outline`` 반환. 없으면 None."""
+        with self._sf() as s:
+            p = s.get(Pipeline, pipeline_id)
+            if p is None or p.series_id is None:
+                return None
+            series = s.get(Series, p.series_id)
+            if series is None:
+                return None
+            outline = series.outline
+            return outline if outline else None
+
+    def _save_series_outline(self, pipeline_id: int, outline_text: str) -> None:
+        """``Series.outline`` 에 커리큘럼 저장. 시리즈 없는 파이프라인은 무시."""
+        with self._sf() as s:
+            p = s.get(Pipeline, pipeline_id)
+            if p is None or p.series_id is None:
+                return
+            series = s.get(Series, p.series_id)
+            if series is None:
+                return
+            series.outline = outline_text
+            s.commit()
 
     # ─────────────────────────────────────────────────────────────────────
     # 2단계 보조 — 이미지 프롬프트 생성 (Claude → 사용자 → ChatGPT 웹)

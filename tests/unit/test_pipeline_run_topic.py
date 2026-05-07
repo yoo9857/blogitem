@@ -139,9 +139,7 @@ class TestRunTopicSuccess:
         artifact_store: ArtifactStore,
         prompt_lib: MagicMock,
     ) -> None:
-        series = service.create_series_with_pipelines(
-            topic="C언어 20강", lecture_count=3
-        )
+        service.create_series_with_pipelines(topic="C언어 20강", lecture_count=3)
         pipelines = service.list_pipelines()
         first = next(p for p in pipelines if p.position == 1)
 
@@ -154,6 +152,116 @@ class TestRunTopicSuccess:
         )
 
         prompt_lib.topic.assert_called_once_with(topic="C언어 20강", lecture_count=20)
+
+
+# ── 시리즈 캐싱 (P14) ──────────────────────────────────────────────────────────
+
+
+class TestSeriesCurriculumSharing:
+    def test_first_call_saves_to_series_outline(
+        self,
+        service: PipelineService,
+        artifact_store: ArtifactStore,
+        prompt_lib: MagicMock,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        from blogitem.pipeline.models import Series
+
+        series = service.create_series_with_pipelines(
+            topic="C언어 20강", lecture_count=3
+        )
+        first = next(p for p in service.list_pipelines() if p.position == 1)
+
+        # 시리즈는 처음에 outline 비어있음
+        with session_factory() as s:
+            srow = s.get(Series, series.id)
+            assert srow is not None
+            assert not srow.outline
+
+        service.run_topic_stage(
+            first.id,
+            llm=_success_llm(text='{"series_title":"x"}'),
+            prompt_lib=prompt_lib,
+            artifact_store=artifact_store,
+        )
+
+        # Claude 응답이 series.outline 에 저장됐는지
+        with session_factory() as s:
+            srow = s.get(Series, series.id)
+            assert srow is not None
+            assert srow.outline == '{"series_title":"x"}'
+
+    def test_second_call_reuses_outline_no_llm(
+        self,
+        service: PipelineService,
+        artifact_store: ArtifactStore,
+        prompt_lib: MagicMock,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        """같은 시리즈 두번째 파이프라인은 Claude 호출 없이 outline 재사용."""
+        service.create_series_with_pipelines(topic="C언어 20강", lecture_count=3)
+        pipelines = sorted(service.list_pipelines(), key=lambda p: p.position)
+        first, second = pipelines[0], pipelines[1]
+
+        # 1번 파이프라인 — Claude 호출
+        llm1 = _success_llm(text='{"series_title":"shared"}')
+        service.run_topic_stage(
+            first.id,
+            llm=llm1,
+            prompt_lib=prompt_lib,
+            artifact_store=artifact_store,
+        )
+        assert llm1.complete.call_count == 1
+
+        # 2번 파이프라인 — 같은 시리즈 → Claude 호출 X (재사용)
+        llm2 = _success_llm()
+        result = service.run_topic_stage(
+            second.id,
+            llm=llm2,
+            prompt_lib=prompt_lib,
+            artifact_store=artifact_store,
+        )
+        assert llm2.complete.call_count == 0
+        assert result.success is True
+        assert result.input_tokens == 0  # 캐시 히트 — 토큰 사용 없음
+
+        # 2번 artifact 도 정상 저장됐는지
+        abs_path = artifact_store.absolute_path(result.artifact_rel_path or "")
+        assert abs_path.is_file()
+        assert abs_path.read_text(encoding="utf-8") == '{"series_title":"shared"}'
+
+    def test_third_call_also_reuses(
+        self,
+        service: PipelineService,
+        artifact_store: ArtifactStore,
+        prompt_lib: MagicMock,
+    ) -> None:
+        service.create_series_with_pipelines(topic="C언어 20강", lecture_count=5)
+        pipelines = sorted(service.list_pipelines(), key=lambda p: p.position)
+
+        llm = _success_llm(text='{"series_title":"once"}')
+        # 1, 2, 3, 4, 5 모두 실행
+        for p in pipelines:
+            service.run_topic_stage(
+                p.id, llm=llm, prompt_lib=prompt_lib, artifact_store=artifact_store
+            )
+        # Claude 는 정확히 1번만 호출됨 (5강 전체 공유)
+        assert llm.complete.call_count == 1
+
+    def test_pipeline_without_series_always_calls_llm(
+        self,
+        service: PipelineService,
+        artifact_store: ArtifactStore,
+        prompt_lib: MagicMock,
+    ) -> None:
+        """단일 파이프라인 (시리즈 없음) 은 캐시 대상 없음 — 항상 Claude 호출."""
+        p1 = service.create_pipeline(topic="solo-a")
+        p2 = service.create_pipeline(topic="solo-b")
+
+        llm = _success_llm()
+        service.run_topic_stage(p1.id, llm=llm, prompt_lib=prompt_lib, artifact_store=artifact_store)
+        service.run_topic_stage(p2.id, llm=llm, prompt_lib=prompt_lib, artifact_store=artifact_store)
+        assert llm.complete.call_count == 2  # 각자 호출
 
 
 # ── 실패 케이스 ────────────────────────────────────────────────────────────────
