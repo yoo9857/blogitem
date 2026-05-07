@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Protocol
 
 
@@ -35,16 +36,22 @@ class LlmResponse:
 
 
 class LlmClient(Protocol):
-    """LLM 호출 추상화. ``ClaudeClient`` 가 구현."""
+    """LLM 호출 추상화. ``ClaudeClient`` / ``CliLlmClient`` 가 구현.
+
+    ``on_line`` 콜백:
+        설정 시 라인 단위 stdout 을 호출자(UI)에게 스트리밍.
+        구현체가 지원 안 하면 무시 (ClaudeClient = SDK 동기 호출 → 무시).
+    """
 
     def complete(
         self,
         *,
         system: str,
         user: str,
-        model: str,
+        model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 1.0,
+        on_line: Callable[[str], None] | None = None,
     ) -> LlmResponse:
         """단일 메시지 호출. 재시도 정책은 구현체 책임."""
         ...

@@ -49,6 +49,7 @@ class ClaudeClient:
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 1.0,
+        on_line: object = None,  # noqa: ARG002 — Protocol 호환, SDK 동기 호출이라 사용 X
     ) -> LlmResponse:
         """단일 메시지 호출. 시스템 + 유저 프롬프트.
 

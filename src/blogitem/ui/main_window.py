@@ -80,6 +80,15 @@ class MainWindow(QMainWindow):
         settings_action.triggered.connect(self._open_settings)
         settings_menu.addAction(settings_action)
 
+        view_menu = bar.addMenu("&보기")
+        toggle_terminal = QAction("터미널 표시/숨김", self)
+        toggle_terminal.setShortcut("Ctrl+`")
+        toggle_terminal.setCheckable(True)
+        toggle_terminal.setChecked(True)
+        toggle_terminal.triggered.connect(self._toggle_terminal)
+        view_menu.addAction(toggle_terminal)
+        self._toggle_terminal_action = toggle_terminal
+
         help_menu = bar.addMenu("&도움말")
         about_action = QAction("blogitem 정보", self)
         about_action.triggered.connect(self._open_about)
@@ -88,8 +97,12 @@ class MainWindow(QMainWindow):
     # ── 본문 ────────────────────────────────────────────────────────────────
 
     def _build_central(self) -> None:
+        from PySide6.QtCore import Qt as _Qt
+        from PySide6.QtWidgets import QDockWidget
+
         from blogitem.ui.pipeline_detail import PipelineDetailWidget
         from blogitem.ui.pipeline_list import PipelineListWidget
+        from blogitem.ui.terminal_panel import TerminalPanel
 
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setChildrenCollapsible(False)
@@ -108,6 +121,24 @@ class MainWindow(QMainWindow):
         splitter.setSizes([340, 760])
 
         self.setCentralWidget(splitter)
+
+        # ── 하단 도크: 터미널 패널 (CLI 스트리밍 + ad-hoc 프롬프트) ───────────
+        self._terminal = TerminalPanel(settings=self._settings, parent=self)
+        self._terminal_dock = QDockWidget("Terminal", self)
+        self._terminal_dock.setObjectName("TerminalDock")
+        self._terminal_dock.setWidget(self._terminal)
+        self._terminal_dock.setAllowedAreas(_Qt.DockWidgetArea.BottomDockWidgetArea)
+        self.addDockWidget(_Qt.DockWidgetArea.BottomDockWidgetArea, self._terminal_dock)
+        self.resizeDocks([self._terminal_dock], [220], _Qt.Orientation.Vertical)
+
+        # 자동 단계 워커 출력 → 터미널 패널 스트리밍
+        self._detail_widget.output_line.connect(
+            lambda line: self._terminal.append_line(line, kind="stdout")
+        )
+
+        # ad-hoc 입력 → PromptWorker
+        self._terminal.prompt_submitted.connect(self._run_terminal_prompt)
+        self._prompt_worker = None  # type: ignore[var-annotated]
 
     # ── 상태바 ──────────────────────────────────────────────────────────────
 
@@ -204,6 +235,41 @@ class MainWindow(QMainWindow):
 
         dlg = SettingsDialog(parent=self)
         dlg.exec()
+
+    def _toggle_terminal(self, checked: bool) -> None:
+        if hasattr(self, "_terminal_dock"):
+            self._terminal_dock.setVisible(checked)
+
+    # ── 터미널 ad-hoc 프롬프트 ──────────────────────────────────────────────
+
+    def _run_terminal_prompt(self, prompt: str) -> None:
+        from blogitem.ui.workers.prompt_worker import PromptWorker
+
+        if self._prompt_worker is not None and self._prompt_worker.isRunning():
+            self._terminal.append_line(
+                "(이전 호출이 아직 진행 중 — 잠시 후 다시 시도)", kind="error"
+            )
+            return
+
+        self._terminal.set_busy(True)
+        self._prompt_worker = PromptWorker(
+            prompt=prompt, settings=self._settings, parent=self
+        )
+        self._prompt_worker.line_received.connect(
+            lambda line: self._terminal.append_line(line, kind="stdout")
+        )
+        self._prompt_worker.finished_ok.connect(self._on_prompt_ok)
+        self._prompt_worker.failed.connect(self._on_prompt_fail)
+        self._prompt_worker.finished.connect(lambda: self._terminal.set_busy(False))
+        self._prompt_worker.start()
+
+    def _on_prompt_ok(self, response: str) -> None:
+        self._terminal.append_line("(완료)", kind="info")
+        self._terminal.update_status(message="last call: ok")
+
+    def _on_prompt_fail(self, message: str) -> None:
+        self._terminal.append_line(message, kind="error")
+        self._terminal.update_status(message="last call: failed")
 
     def _open_about(self) -> None:
         from PySide6.QtWidgets import QMessageBox

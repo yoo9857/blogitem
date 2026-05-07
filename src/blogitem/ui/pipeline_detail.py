@@ -52,6 +52,7 @@ class PipelineDetailWidget(QWidget):
     """선택 파이프라인의 단계 카드 + 액션 영역."""
 
     pipeline_changed = Signal(int)
+    output_line = Signal(str)  # AutoStageWorker stdout 라인 → TerminalPanel 로 전달
 
     def __init__(
         self,
@@ -198,6 +199,7 @@ class PipelineDetailWidget(QWidget):
             settings=self._settings,
         )
         self._claude_worker.progress.connect(self._progress.setLabelText)
+        self._claude_worker.output_line.connect(self.output_line.emit)
         self._claude_worker.finished_ok.connect(self._on_auto_ok)
         self._claude_worker.failed.connect(self._on_auto_fail)
         self._progress.canceled.connect(self._claude_worker.requestInterruption)

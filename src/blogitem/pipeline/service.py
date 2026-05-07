@@ -204,6 +204,7 @@ class PipelineService:
         artifact_store: ArtifactStore,
         lecture_count: int = 20,
         model: str | None = None,
+        on_line: object = None,
     ) -> StageRunResult:
         topic_text = self._begin_auto_stage(pipeline_id, expected=Stage.TOPIC)
 
@@ -211,7 +212,9 @@ class PipelineService:
             system, user = prompt_lib.topic(
                 topic=topic_text, lecture_count=lecture_count
             )
-            response = llm.complete(system=system, user=user, model=model)
+            response = llm.complete(
+                system=system, user=user, model=model, on_line=on_line
+            )
         except Exception as e:  # noqa: BLE001
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.TOPIC, e)
@@ -316,6 +319,7 @@ class PipelineService:
         prompt_lib: PromptLibrary,
         artifact_store: ArtifactStore,
         model: str | None = None,
+        on_line: object = None,
     ) -> StageRunResult:
         """3단계 — Claude 가 초고 Markdown 작성. TOPIC 산출물 + 이미지 메타 사용."""
         self._begin_auto_stage(pipeline_id, expected=Stage.DRAFT)
@@ -335,7 +339,9 @@ class PipelineService:
                 lecture_meta=lecture_meta,
                 image_descriptions=image_descriptions,
             )
-            response = llm.complete(system=system, user=user, model=model)
+            response = llm.complete(
+                system=system, user=user, model=model, on_line=on_line
+            )
         except Exception as e:  # noqa: BLE001
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.DRAFT, e)
@@ -456,6 +462,7 @@ class PipelineService:
         artifact_store: ArtifactStore,
         channel: PublishChannel,
         model: str | None = None,
+        on_line: object = None,
     ) -> StageRunResult:
         """6단계 — HUMANIZE 산출물(MD) → Claude HTML 변환 → 채널 게시 → DONE."""
         self._begin_auto_stage(pipeline_id, expected=Stage.PUBLISH)
@@ -474,7 +481,9 @@ class PipelineService:
                 humanized_markdown=humanized_md,
                 image_paths=[str(p) for p in image_paths],
             )
-            response = llm.complete(system=sys_p, user=usr_p, model=model)
+            response = llm.complete(
+                system=sys_p, user=usr_p, model=model, on_line=on_line
+            )
         except Exception as e:  # noqa: BLE001
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.PUBLISH, e)

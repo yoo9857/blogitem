@@ -88,10 +88,19 @@ class CliLlmClient:
         model: str | None = None,
         max_tokens: int = 4096,  # noqa: ARG002 — CLI 는 토큰 제한 인자 없음
         temperature: float = 1.0,  # noqa: ARG002 — 동일
+        on_line: callable | None = None,
     ) -> LlmResponse:
-        """단일 메시지 호출. system + user 를 한 프롬프트로 합쳐 CLI 에 전달."""
+        """단일 메시지 호출. system + user 를 한 프롬프트로 합쳐 CLI 에 전달.
+
+        Args:
+            on_line: 콜백. 설정 시 ``subprocess.Popen`` 으로 라인 단위 stdout 을
+                스트리밍 — 호출자(UI)가 실시간 표시 가능. None 이면 ``subprocess.run``
+                blocking + 일괄 캡처 (테스트/단순 호출 호환).
+        """
         if not user:
             raise ValueError("user prompt required")
+        if on_line is not None:
+            return self._complete_streaming(system=system, user=user, model=model, on_line=on_line)
 
         prompt = self._compose_prompt(system, user)
         chosen_model = model or self._default_model
@@ -191,6 +200,180 @@ class CliLlmClient:
                 output_tokens=0,
             )
         finally:
+            if output_file_path is not None:
+                try:
+                    os.unlink(output_file_path)
+                except OSError:
+                    pass
+
+    # ── 스트리밍 호출 (subprocess.Popen) ───────────────────────────────────
+
+    def _complete_streaming(
+        self,
+        *,
+        system: str,
+        user: str,
+        model: str | None,
+        on_line: callable,
+    ) -> LlmResponse:
+        """라인 단위 스트리밍 호출.
+
+        ``subprocess.Popen`` 으로 stdout 을 라인 단위 읽으며 ``on_line`` 콜백 호출.
+        UI 가 실시간으로 진행 상태 표시 가능.
+
+        ``output_file_arg`` 사용 시: 파일에서 최종 응답 읽음 (스트리밍 동안엔 콜백
+        으로 진행 표시). 사용 안 하면 누적 stdout 을 응답으로 사용.
+
+        시간 초과 / 에러는 ``CliLlmError`` raise.
+        """
+        import subprocess
+        import time
+
+        prompt = self._compose_prompt(system, user)
+        chosen_model = model or self._default_model
+
+        output_file_path: str | None = None
+        if self._output_file_arg:
+            import tempfile
+
+            fd, output_file_path = tempfile.mkstemp(suffix=".txt", prefix="blogitem-cli-")
+            os.close(fd)
+
+        cmd = self._build_command(
+            model=chosen_model, prompt=prompt, output_file=output_file_path
+        )
+
+        captured: list[str] = []
+        proc: subprocess.Popen[str] | None = None
+        try:
+            try:
+                proc = subprocess.Popen(  # noqa: S603 — cmd 는 우리가 빌드, prompt 만 외부
+                    cmd,
+                    stdin=subprocess.PIPE if self._stdin_mode else subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,  # 진행 메시지가 stderr 로 나오는 CLI 도 있음
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,  # line-buffered
+                )
+            except FileNotFoundError as e:
+                raise CliLlmError(
+                    f"CLI binary not found: {self._bin_path}",
+                    exit_code=0,
+                    retryable=False,
+                ) from e
+            except OSError as e:
+                raise CliLlmError(
+                    f"CLI exec failed: {type(e).__name__}",
+                    exit_code=0,
+                    retryable=True,
+                ) from e
+
+            if self._stdin_mode and proc.stdin is not None:
+                try:
+                    proc.stdin.write(prompt)
+                    proc.stdin.close()
+                except OSError:
+                    pass
+
+            assert proc.stdout is not None
+            deadline = time.time() + self._timeout
+
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break
+                    if time.time() > deadline:
+                        proc.terminate()
+                        raise CliLlmError(
+                            f"CLI timeout after {self._timeout}s",
+                            exit_code=0,
+                            retryable=True,
+                        )
+                    time.sleep(0.05)
+                    continue
+
+                rendered = line.rstrip("\n")
+                if self._strip_ansi:
+                    rendered = _ANSI_RE.sub("", rendered)
+                captured.append(line)
+                try:
+                    on_line(rendered)
+                except Exception:  # noqa: BLE001 — UI 콜백 실패는 호출 흐름 깨면 안 됨
+                    pass
+
+                if time.time() > deadline:
+                    proc.terminate()
+                    raise CliLlmError(
+                        f"CLI timeout after {self._timeout}s",
+                        exit_code=0,
+                        retryable=True,
+                    )
+
+            try:
+                returncode = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired as e:
+                proc.kill()
+                raise CliLlmError(
+                    "CLI failed to exit cleanly", exit_code=0, retryable=True
+                ) from e
+
+            if returncode != 0:
+                tail = "".join(captured[-20:]).strip()[:500]
+                retryable = _looks_retryable(tail)
+                raise CliLlmError(
+                    f"CLI exit {returncode}: {tail or '(no output)'}",
+                    exit_code=returncode,
+                    retryable=retryable,
+                )
+
+            # 응답 텍스트 — output_file 이면 거기서, 아니면 누적 stdout.
+            if output_file_path is not None:
+                try:
+                    with open(output_file_path, encoding="utf-8") as f:
+                        text = f.read()
+                except OSError as e:
+                    raise CliLlmError(
+                        f"output file read failed: {type(e).__name__}",
+                        exit_code=0,
+                        retryable=False,
+                    ) from e
+            else:
+                text = "".join(captured)
+                if self._strip_ansi:
+                    text = _ANSI_RE.sub("", text)
+
+            text = text.strip()
+
+            if _looks_quota_exceeded(text):
+                raise CliLlmError(
+                    f"CLI quota/limit hit: {text[:200]}",
+                    exit_code=0,
+                    retryable=False,
+                )
+
+            if not text:
+                raise CliLlmError(
+                    "CLI returned empty response",
+                    exit_code=0,
+                    retryable=True,
+                )
+
+            return LlmResponse(
+                text=text,
+                model=chosen_model or "cli",
+                input_tokens=0,
+                output_tokens=0,
+            )
+        finally:
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
             if output_file_path is not None:
                 try:
                     os.unlink(output_file_path)

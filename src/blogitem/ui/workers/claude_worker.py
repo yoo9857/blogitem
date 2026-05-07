@@ -29,6 +29,7 @@ class AutoStageWorker(QThread):
     finished_ok = Signal(int, str)
     failed = Signal(int, str)
     progress = Signal(str)
+    output_line = Signal(str)  # CLI subprocess stdout 라인 (TerminalPanel 연결)
 
     def __init__(
         self,
@@ -69,6 +70,9 @@ class AutoStageWorker(QThread):
             prompts = PromptLibrary()
             store = ArtifactStore(self._settings.artifacts_dir)
 
+            def emit_line(line: str) -> None:
+                self.output_line.emit(line)
+
             if self._stage == Stage.TOPIC:
                 self.progress.emit(self._stage_message("주제·커리큘럼 설계"))
                 result = self._service.run_topic_stage(
@@ -78,6 +82,7 @@ class AutoStageWorker(QThread):
                     artifact_store=store,
                     lecture_count=self._lecture_count,
                     model=self._effective_model(),
+                    on_line=emit_line,
                 )
             elif self._stage == Stage.DRAFT:
                 self.progress.emit(self._stage_message("초고 작성"))
@@ -87,6 +92,7 @@ class AutoStageWorker(QThread):
                     prompt_lib=prompts,
                     artifact_store=store,
                     model=self._effective_model(),
+                    on_line=emit_line,
                 )
             else:  # Stage.PUBLISH
                 self.progress.emit(self._stage_message("HTML 변환 + 채널 게시"))
@@ -98,6 +104,7 @@ class AutoStageWorker(QThread):
                     artifact_store=store,
                     channel=channel,
                     model=self._effective_model(),
+                    on_line=emit_line,
                 )
 
             if result.success and result.artifact_rel_path:
