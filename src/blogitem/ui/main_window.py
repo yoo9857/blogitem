@@ -167,6 +167,7 @@ class MainWindow(QMainWindow):
     def _start_watchdog(self) -> None:
         from blogitem.naver.token_store import TokenStore
         from blogitem.notify.notifier import Notifier
+        from blogitem.pipeline.orchestrator import make_orchestrator_service
         from blogitem.watchdog.monitor import make_watchdog_service
 
         self._notifier = Notifier()
@@ -179,6 +180,43 @@ class MainWindow(QMainWindow):
         self._watchdog.token_expiring.connect(self._on_token_expiring)
         self._watchdog.queue_summary.connect(self._on_queue_summary)
         self._watchdog.start(interval_min=60)
+
+        # Orchestrator (자동 advance loop) — 사용자가 enable 한 경우만 동작
+        self._orchestrator = make_orchestrator_service(
+            service=self._service,
+            settings=self._settings,
+            parent=self,
+        )
+        self._orchestrator.pipeline_started.connect(self._on_orchestrator_started)
+        self._orchestrator.pipeline_advanced.connect(self._on_orchestrator_advanced)
+        self._orchestrator.pipeline_failed.connect(self._on_orchestrator_failed)
+        self._orchestrator.output_line.connect(
+            lambda line: self._terminal.append_line(line, kind="stdout")
+        )
+        if self._settings.orchestrator_enabled:
+            self._orchestrator.start()
+            self._terminal.append_line(
+                "(Orchestrator 활성 — PENDING 자동 단계 자동 진행)", kind="info"
+            )
+
+    def _on_orchestrator_started(self, pipeline_id: int, stage: str) -> None:
+        self._terminal.append_line(
+            f"🤖 #{pipeline_id} {stage} 단계 자동 시작…", kind="info"
+        )
+
+    def _on_orchestrator_advanced(self, pipeline_id: int, stage: str) -> None:
+        self._terminal.append_line(
+            f"✓ #{pipeline_id} → {stage}", kind="assistant"
+        )
+        self._list_widget.refresh()
+        if self._detail_widget._current_id == pipeline_id:
+            self._detail_widget.show_pipeline(pipeline_id)
+
+    def _on_orchestrator_failed(self, pipeline_id: int, message: str) -> None:
+        self._terminal.append_line(
+            f"⚠ #{pipeline_id} 자동 실행 실패: {message}", kind="error"
+        )
+        self._list_widget.refresh()
 
     def _on_stuck_found(self, stuck_list: list[StuckPipeline]) -> None:
         if not stuck_list:
@@ -289,9 +327,11 @@ class MainWindow(QMainWindow):
     # ── 종료 처리 ───────────────────────────────────────────────────────────
 
     def closeEvent(self, event: object) -> None:  # noqa: N802
-        if hasattr(self, "_watchdog"):
-            try:
-                self._watchdog.stop()
-            except Exception:  # noqa: BLE001
-                pass
+        for service_attr in ("_orchestrator", "_watchdog"):
+            svc = getattr(self, service_attr, None)
+            if svc is not None:
+                try:
+                    svc.stop()
+                except Exception:  # noqa: BLE001
+                    pass
         super().closeEvent(event)  # type: ignore[arg-type]

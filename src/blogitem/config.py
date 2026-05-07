@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     llm_cli_model: str = ""           # 빈 값이면 CLI 기본 모델 사용
     llm_cli_timeout_sec: int = Field(default=600, ge=30, le=3600)
 
+    # ── Orchestrator (자동 advance loop) ──────────────────────────────────
+    # 켜면 PENDING 상태 자동 단계(TOPIC/DRAFT/PUBLISH)를 주기적으로 자동 실행.
+    # CLI 모드(claude_cli/codex_cli)와 함께 쓰면 사용자 개입 없이 비용 0 으로
+    # 파이프라인 자동 처리. dry_run=true 와 함께 안전하게 시작 추천.
+    orchestrator_enabled: bool = False
+    orchestrator_interval_min: int = Field(default=5, ge=1, le=120)
+
     # ── P6: 메일 발행 폴백 ────────────────────────────────────────────────
     smtp_host: str = ""
     smtp_port: int = Field(default=587, ge=1, le=65535)
