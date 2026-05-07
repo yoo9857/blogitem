@@ -49,6 +49,10 @@ if TYPE_CHECKING:
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
+class SeriesPromptsAlreadyExistsError(RuntimeError):
+    """시리즈 이미지 프롬프트가 이미 생성됨 — force=True 없이는 재생성 차단."""
+
+
 def slugify(text: str) -> str:
     """간단한 슬러그화. 영문/숫자만 보존, 빈 결과 시 'topic' 폴백."""
     s = _SLUG_RE.sub("-", text.lower().strip()).strip("-")
@@ -304,14 +308,17 @@ class PipelineService:
             )
 
         # 캐시 미스 — Claude 호출
+        # 시리즈 파이프라인이면 실제 형제 수를 강의 수로 사용 (사용자가 시리즈 생성 시
+        # 정한 값). 시리즈 없는 단일 파이프라인은 호출 인자 그대로.
+        effective_count = self._series_lecture_count(pipeline_id) or lecture_count
         try:
             system, user = prompt_lib.topic(
-                topic=topic_text, lecture_count=lecture_count
+                topic=topic_text, lecture_count=effective_count
             )
             response = llm.complete(
                 system=system, user=user, model=model, on_line=on_line
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.TOPIC, e)
 
@@ -390,6 +397,22 @@ class PipelineService:
         # 백필 — 다음번엔 형제 검색 없이 빠른 경로
         self._save_series_outline(pipeline_id, text)
         return text
+
+    def _series_lecture_count(self, pipeline_id: int) -> int | None:
+        """파이프라인이 속한 시리즈의 형제 파이프라인 수 = 의도된 강의 수.
+
+        시리즈 없는 단일 파이프라인은 None — 호출자가 기본값 사용.
+        """
+        with self._sf() as s:
+            p = s.get(Pipeline, pipeline_id)
+            if p is None or p.series_id is None:
+                return None
+            count = s.scalar(
+                select(func.count(Pipeline.id)).where(
+                    Pipeline.series_id == p.series_id
+                )
+            )
+            return int(count) if count else None
 
     def _save_series_outline(self, pipeline_id: int, outline_text: str) -> None:
         """``Series.outline`` 에 커리큘럼 저장. 시리즈 없는 파이프라인은 무시."""
@@ -486,6 +509,180 @@ class PipelineService:
             )
             s.commit()
         return record
+
+    # ─────────────────────────────────────────────────────────────────────
+    # 2단계 보조 — 시리즈 단위 이미지 프롬프트 (썸네일 1 + 강당 본문 1)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def generate_series_image_prompts(
+        self,
+        series_id: int,
+        *,
+        llm: LlmClient,
+        prompt_lib: PromptLibrary,
+        artifact_store: ArtifactStore,
+        model: str | None = None,
+        on_line: object = None,
+        force: bool = False,
+    ) -> dict[str, object]:
+        """시리즈 한 번에 — 시리즈 썸네일 1 + 강당 본문 1 = N+1 프롬프트.
+
+        결과 JSON 은 시리즈 첫 파이프라인(position=1)의 IMAGE 단계 산출물로 저장.
+        강의별 매핑은 응답 JSON 의 ``lecture_position`` 필드로 보존.
+
+        Args:
+            series_id: 대상 시리즈 ID.
+            force: True 면 기존 산출물이 있어도 재생성. 기본 False — 이미 있으면
+                ``SeriesPromptsAlreadyExistsError`` 발생.
+
+        Returns:
+            저장된 JSON dict (UI 즉시 표시용).
+
+        Raises:
+            ValueError: 시리즈/파이프라인/커리큘럼이 없거나 비정상.
+            SeriesPromptsAlreadyExistsError: 이미 생성됨 + force=False.
+            RuntimeError: 커리큘럼 JSON 파싱 실패.
+        """
+        # 시리즈 + 첫 파이프라인 + 커리큘럼 수집
+        with self._sf() as s:
+            series = s.get(Series, series_id)
+            if series is None:
+                raise ValueError(f"series {series_id} not found")
+            series_topic = series.topic
+            outline = series.outline
+
+            first_pipeline = s.execute(
+                select(Pipeline)
+                .where(Pipeline.series_id == series_id)
+                .order_by(Pipeline.position.asc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if first_pipeline is None:
+                raise ValueError(f"series {series_id} has no pipelines")
+            first_pipeline_id = int(first_pipeline.id)
+
+            # 멱등성 — 이미 생성됐으면 차단
+            if not force:
+                existing = self._latest_artifact(
+                    s, first_pipeline_id, Stage.IMAGE, "image_prompts"
+                )
+                if existing is not None:
+                    raise SeriesPromptsAlreadyExistsError(
+                        f"시리즈 #{series_id} 이미지 프롬프트가 이미 생성됨 "
+                        f"(artifact #{existing.id}). 재생성하려면 force=True."
+                    )
+
+            # outline 폴백 — Series.outline 없으면 첫 파이프라인 TOPIC artifact
+            if not outline:
+                topic_artifact = self._latest_artifact(
+                    s, first_pipeline_id, Stage.TOPIC, "text"
+                )
+                outline_path = topic_artifact.path if topic_artifact else None
+            else:
+                outline_path = None
+
+        # outline 텍스트 확보
+        if outline:
+            outline_text = outline
+        elif outline_path:
+            try:
+                outline_text = artifact_store.absolute_path(outline_path).read_text(
+                    encoding="utf-8"
+                )
+            except (OSError, UnicodeDecodeError) as e:
+                raise RuntimeError(f"커리큘럼 파일 읽기 실패: {e}") from e
+        else:
+            raise RuntimeError(
+                "커리큘럼이 없음 — 1단계(TOPIC) 를 먼저 실행하세요."
+            )
+
+        try:
+            curriculum = json.loads(outline_text)
+        except json.JSONDecodeError as e:
+            raise RuntimeError(f"커리큘럼 JSON 파싱 실패: {e}") from e
+
+        lectures = curriculum.get("lectures") if isinstance(curriculum, dict) else None
+        if not isinstance(lectures, list) or not lectures:
+            raise RuntimeError("커리큘럼에 lectures 배열이 없음")
+
+        # LLM 호출
+        system, user = prompt_lib.series_image_prompts(
+            series_topic=series_topic,
+            lectures=[lec for lec in lectures if isinstance(lec, dict)],
+        )
+        response = llm.complete(
+            system=system, user=user, model=model, on_line=on_line
+        )
+
+        # 첫 파이프라인의 IMAGE 단계 산출물로 저장
+        record = artifact_store.save_text(
+            pipeline_id=first_pipeline_id,
+            stage=Stage.IMAGE,
+            text=response.text,
+            ext=".json",
+        )
+        with self._sf() as s:
+            s.add(
+                Artifact(
+                    pipeline_id=first_pipeline_id,
+                    stage=Stage.IMAGE,
+                    kind="image_prompts",
+                    path=record.rel_path,
+                    sha256=record.sha256,
+                    size=record.size,
+                    mime="application/json; charset=utf-8",
+                )
+            )
+            s.commit()
+
+        # 파싱해서 dict 반환 — UI 즉시 표시
+        try:
+            data = json.loads(response.text)
+            return data if isinstance(data, dict) else {"raw": response.text}
+        except json.JSONDecodeError:
+            return {"raw": response.text}
+
+    def has_series_image_prompts(self, series_id: int) -> bool:
+        """시리즈 첫 파이프라인에 이미지 프롬프트 산출물이 이미 있는지."""
+        with self._sf() as s:
+            first_pipeline = s.execute(
+                select(Pipeline)
+                .where(Pipeline.series_id == series_id)
+                .order_by(Pipeline.position.asc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if first_pipeline is None:
+                return False
+            existing = self._latest_artifact(
+                s, int(first_pipeline.id), Stage.IMAGE, "image_prompts"
+            )
+            return existing is not None
+
+    def read_series_image_prompts(
+        self, series_id: int, *, artifact_store: ArtifactStore
+    ) -> dict[str, object] | None:
+        """저장된 시리즈 이미지 프롬프트 JSON 을 dict 로 반환. 없으면 None."""
+        with self._sf() as s:
+            first_pipeline = s.execute(
+                select(Pipeline)
+                .where(Pipeline.series_id == series_id)
+                .order_by(Pipeline.position.asc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if first_pipeline is None:
+                return None
+            artifact = self._latest_artifact(
+                s, int(first_pipeline.id), Stage.IMAGE, "image_prompts"
+            )
+            rel_path = artifact.path if artifact else None
+        if rel_path is None:
+            return None
+        try:
+            text = artifact_store.absolute_path(rel_path).read_text(encoding="utf-8")
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
 
     def read_image_prompts(
         self,
@@ -598,7 +795,7 @@ class PipelineService:
             series_topic, lecture_meta, image_descriptions = self._gather_draft_inputs(
                 pipeline_id, artifact_store
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.DRAFT, e)
 
@@ -611,7 +808,7 @@ class PipelineService:
             response = llm.complete(
                 system=system, user=user, model=model, on_line=on_line
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.DRAFT, e)
 
@@ -740,7 +937,7 @@ class PipelineService:
             title, humanized_md, image_paths = self._gather_publish_inputs(
                 pipeline_id, artifact_store
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.PUBLISH, e)
 
@@ -753,7 +950,7 @@ class PipelineService:
             response = llm.complete(
                 system=sys_p, user=usr_p, model=model, on_line=on_line
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.PUBLISH, e)
 
@@ -771,7 +968,7 @@ class PipelineService:
                 contents_html=response.text,
                 image_paths=image_paths,
             )
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             # HTML artifact 는 이미 저장 — 다시 호출 시 재사용 가능 (멱등성)
             self._mark_stage_failed(pipeline_id, error=str(e))
             return _failed_result(pipeline_id, Stage.PUBLISH, e)

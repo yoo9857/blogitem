@@ -62,6 +62,23 @@ class MainWindow(QMainWindow):
         new_series.triggered.connect(self._open_new_series)
         file_menu.addAction(new_series)
 
+        series_prompts = QAction("🎨 시리즈 이미지 프롬프트", self)
+        series_prompts.setShortcut("Ctrl+I")
+        series_prompts.setToolTip(
+            "시리즈 단위로 이미지 프롬프트 한 번에 생성 — 시리즈 썸네일 1 + 강당 본문 1. "
+            "이미 생성됐으면 기존 프롬프트만 표시."
+        )
+        series_prompts.triggered.connect(self._open_series_image_prompts)
+        file_menu.addAction(series_prompts)
+
+        regen_prompts = QAction("🔄 시리즈 이미지 프롬프트 강제 재생성", self)
+        regen_prompts.setShortcut("Ctrl+Shift+I")
+        regen_prompts.setToolTip(
+            "기존 프롬프트를 무시하고 Claude 를 다시 호출. 비용 발생 — 확인 다이얼로그 띄움."
+        )
+        regen_prompts.triggered.connect(self._force_regen_series_image_prompts)
+        file_menu.addAction(regen_prompts)
+
         refresh = QAction("새로고침", self)
         refresh.setShortcut("F5")
         refresh.triggered.connect(self._refresh_list)
@@ -271,6 +288,134 @@ class MainWindow(QMainWindow):
     def _refresh_list(self) -> None:
         self._list_widget.refresh()
 
+    # ── 시리즈 이미지 프롬프트 ────────────────────────────────────────────────
+
+    def _force_regen_series_image_prompts(self) -> None:
+        """기존 산출물 무시하고 강제 재생성 — 사용자 확인 후."""
+        from PySide6.QtWidgets import QMessageBox
+
+        pid = self._list_widget.current_pipeline_id()
+        if pid is None:
+            QMessageBox.information(
+                self,
+                "재생성",
+                "좌측에서 시리즈에 속한 파이프라인을 먼저 선택하세요.",
+            )
+            return
+        dto = self._service.get_pipeline(pid)
+        if dto is None or dto.series_id is None:
+            QMessageBox.information(
+                self, "재생성", "이 파이프라인은 시리즈에 속해있지 않습니다."
+            )
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "강제 재생성",
+            "기존 시리즈 이미지 프롬프트를 무시하고 Claude 를 다시 호출합니다.\n"
+            "(LLM 호출 비용 발생 — claude_cli 모드면 구독 한도 차감)\n\n"
+            "계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self._open_series_image_prompts(force=True)
+
+    def _open_series_image_prompts(self, force: bool = False) -> None:
+        """좌측에서 선택된 파이프라인의 시리즈에 대해 이미지 프롬프트 다이얼로그.
+
+        - 이미 생성된 경우: 기존 프롬프트 다이얼로그 표시 (재생성 X — "다시 안 됨")
+        - 없으면: Claude 호출 → 저장 → 다이얼로그
+        """
+        from PySide6.QtWidgets import QMessageBox, QProgressDialog
+
+        from blogitem.pipeline.artifacts import ArtifactStore
+        from blogitem.ui.image_prompts_dialog import ImagePromptsDialog
+        from blogitem.ui.workers.series_image_prompts_worker import (
+            SeriesImagePromptsWorker,
+        )
+
+        pid = self._list_widget.current_pipeline_id()
+        if pid is None:
+            QMessageBox.information(
+                self,
+                "시리즈 이미지 프롬프트",
+                "좌측에서 시리즈에 속한 파이프라인을 먼저 선택하세요.",
+            )
+            return
+
+        dto = self._service.get_pipeline(pid)
+        if dto is None or dto.series_id is None:
+            QMessageBox.information(
+                self,
+                "시리즈 이미지 프롬프트",
+                "이 파이프라인은 시리즈에 속해있지 않습니다 — 시리즈 단위 생성 불가.",
+            )
+            return
+        series_id = int(dto.series_id)
+
+        # 이미 생성됐으면 다시 호출 안 하고 다이얼로그만 (force 면 스킵)
+        if not force and self._service.has_series_image_prompts(series_id):
+            store = ArtifactStore(self._settings.artifacts_dir)
+            data = self._service.read_series_image_prompts(
+                series_id, artifact_store=store
+            )
+            if data is None:
+                QMessageBox.warning(
+                    self,
+                    "시리즈 이미지 프롬프트",
+                    "산출물이 있다고 표시되지만 읽기 실패 — 파일을 확인하세요.",
+                )
+                return
+            ImagePromptsDialog(prompts_data=data, parent=self).exec()
+            return
+
+        # 신규 생성 — 진행 다이얼로그 + 워커
+        progress = QProgressDialog(
+            "Claude — 시리즈 이미지 프롬프트 생성 중…",
+            "취소",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle("시리즈 이미지 프롬프트")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        worker = SeriesImagePromptsWorker(
+            series_id=series_id,
+            service=self._service,
+            settings=self._settings,
+            force=force,
+            parent=self,
+        )
+
+        def on_ok(_sid: int, data: dict) -> None:
+            progress.close()
+            ImagePromptsDialog(prompts_data=data, parent=self).exec()
+
+        def on_already(sid: int) -> None:
+            # 레이스 — has_check 와 worker 사이에 다른 곳이 만든 경우. 그냥 표시.
+            progress.close()
+            store = ArtifactStore(self._settings.artifacts_dir)
+            data = self._service.read_series_image_prompts(sid, artifact_store=store)
+            if data is not None:
+                ImagePromptsDialog(prompts_data=data, parent=self).exec()
+
+        def on_fail(_sid: int, msg: str) -> None:
+            progress.close()
+            QMessageBox.critical(self, "시리즈 프롬프트 생성 실패", msg)
+
+        worker.line_received.connect(
+            lambda line: self._terminal.append_line(line, kind="stdout")
+        )
+        worker.finished_ok.connect(on_ok)
+        worker.already_exists.connect(on_already)
+        worker.failed.connect(on_fail)
+        progress.canceled.connect(worker.requestInterruption)
+        worker.start()
+
     def _open_settings(self) -> None:
         from blogitem.ui.settings_dialog import SettingsDialog
 
@@ -329,12 +474,12 @@ class MainWindow(QMainWindow):
 
     # ── 종료 처리 ───────────────────────────────────────────────────────────
 
-    def closeEvent(self, event: object) -> None:  # noqa: N802
+    def closeEvent(self, event: object) -> None:
         for service_attr in ("_orchestrator", "_watchdog"):
             svc = getattr(self, service_attr, None)
             if svc is not None:
                 try:
                     svc.stop()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
         super().closeEvent(event)  # type: ignore[arg-type]

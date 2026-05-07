@@ -190,6 +190,120 @@ class PromptLibrary:
         )
         return system, user
 
+    # ── 2단계 보조: 시리즈 단위 이미지 프롬프트 ────────────────────────────────
+
+    def series_image_prompts(
+        self,
+        *,
+        series_topic: str,
+        lectures: list[dict[str, object]],
+    ) -> tuple[str, str]:
+        """시리즈 전체 이미지 프롬프트 — 시리즈 썸네일 1장 + 강당 본문 1장.
+
+        강의가 N개면 출력 프롬프트는 N+1개 (썸네일 1 + 본문 N).
+        각 본문 프롬프트는 ``lecture_position``/``lecture_title`` 로 강의에 매핑.
+        사용자는 결과를 ChatGPT 웹에 붙여넣어 이미지 생성 후 다운로드.
+
+        Args:
+            series_topic: 시리즈 전체 제목/주제 (썸네일 컨텍스트).
+            lectures: 1단계 산출물의 ``lectures`` 배열 — 각 항목은
+                ``{position, title, summary, key_concepts, ...}`` dict.
+
+        Returns:
+            (system, user). user 출력은 순수 JSON.
+        """
+        system = (
+            "당신은 한국어 IT 강의 교재의 시각자료를 설계하는 시니어 인스트럭셔널 "
+            "디자이너입니다. 강사가 강의에서 그대로 보여줄 수 있는 '교재형 "
+            "다이어그램' 이미지를 위한 프롬프트를 작성합니다 — 사용자가 ChatGPT 웹에 "
+            "붙여넣어 이미지를 생성하기 위한 영문 프롬프트.\n"
+            "\n"
+            "톤 (절대 원칙):\n"
+            "- 전문 강사 / 대학 교재 / 기술 문서 톤 — 신뢰감 있고 정돈됨\n"
+            "- 'cute', 'playful', 'whimsical', 'cartoonish', 'fun' 같은 형용사 절대 X\n"
+            "- 'tiny floating <symbol>', 'decorative motifs', 'glowing softly' 같은 "
+            "장식 요소 절대 X — 핵심 개념 시각화 외에 떠다니는 기호/장식 금지\n"
+            "- 화면에 들어가는 요소 5개 이내, 각 요소는 강의 핵심 개념을 직접 설명\n"
+            "\n"
+            "구성 원칙:\n"
+            "- 시리즈 썸네일 1장: 시리즈 전체 주제 — 메인 키워드 1~2개를 큰 타이포 + "
+            "심볼 1개로 표현. 깔끔한 표지/커버 느낌.\n"
+            "- 강당 본문 1장: 강의 핵심 개념의 다이어그램 — 박스/화살표/라벨로 "
+            "정확하게 설명. 메모리 그림, 플로우 차트, 컴포넌트 관계도 같은 형식.\n"
+            "- 시리즈 안에서 모든 이미지가 시각적으로 일관 (같은 색감/선 굵기/타이포)\n"
+            "\n"
+            "스타일 가이드 (영문 프롬프트에 그대로 사용):\n"
+            "- 'Clean technical diagram, instructional textbook style'\n"
+            "- 'Flat vector, minimal, sharp lines, professional'\n"
+            "- 1024x1024 square, generous white/neutral background\n"
+            "- 색감: muted, 2-3색 제한 (예: cream/ink/terracotta 또는 white/navy/red)\n"
+            "- 텍스트는 영어 라벨만 (한국어 X — 깨짐). 라벨은 박스 옆/안에 배치.\n"
+            "- gradient 금지, glow 금지, 그림자 최소.\n"
+            "\n"
+            "출력 형식: 순수 JSON. 코드 블록(```)이나 설명 텍스트 없이 JSON 만."
+        )
+
+        # 강의 메타 — 토큰 절약 위해 핵심 필드만 추출
+        compact_lectures: list[dict[str, object]] = []
+        for lec in lectures:
+            if not isinstance(lec, dict):
+                continue
+            compact_lectures.append(
+                {
+                    "position": lec.get("position"),
+                    "title": lec.get("title"),
+                    "summary": lec.get("summary"),
+                    "key_concepts": lec.get("key_concepts") or [],
+                }
+            )
+        n_body = len(compact_lectures)
+        total = n_body + 1  # +1 thumbnail
+
+        schema_example = {
+            "style_guide": "시리즈 전체 이미지의 공통 시각 스타일 (1-2 문장)",
+            "images": [
+                {
+                    "role": "thumbnail",
+                    "position": 0,
+                    "lecture_position": None,
+                    "lecture_title": None,
+                    "purpose": "시리즈 전체를 대표하는 썸네일 (1 문장)",
+                    "prompt": (
+                        "ChatGPT 에 붙여넣을 영문/한국어 혼용 프롬프트. "
+                        "시리즈 제목 + 시리즈 전체 핵심 콘셉트 + 스타일."
+                    ),
+                },
+                {
+                    "role": "body",
+                    "position": 1,
+                    "lecture_position": 1,
+                    "lecture_title": "1강 제목 (그대로 복사)",
+                    "purpose": "1강의 학습 포인트를 시각화",
+                    "prompt": "...",
+                },
+            ],
+        }
+        schema_str = json.dumps(schema_example, ensure_ascii=False, indent=2)
+        lectures_str = json.dumps(compact_lectures, ensure_ascii=False, indent=2)
+
+        user = (
+            f"시리즈 주제: {series_topic}\n"
+            f"강의 수: {n_body}\n"
+            f"\n"
+            f"강의 목록:\n{lectures_str}\n"
+            f"\n"
+            f"위 시리즈에 들어갈 이미지 프롬프트를 다음 JSON 스키마로 작성:\n"
+            f"\n"
+            f"{schema_str}\n"
+            f"\n"
+            f"`images` 배열에 정확히 {total}개:\n"
+            f"- 썸네일 1개 (role=thumbnail, position=0, lecture_position=null)\n"
+            f"- 본문 {n_body}개 (role=body, position=1..{n_body}, "
+            f"각 본문의 lecture_position 은 위 강의 목록의 position 과 일치, "
+            f"lecture_title 은 그 강의 제목 그대로 복사)."
+        )
+        return system, user
+
     # ── 6단계: 게시 (네이버 블로그 HTML) ──────────────────────────────────────
 
     def publish(
