@@ -73,9 +73,31 @@ class PipelineDetailWidget(QWidget):
             "font-size: 16px; font-weight: 600; padding: 12px;"
         )
 
+        # 액션 영역 — 시각적으로 강조 (놓치지 않도록 배경 + 테두리 + 라벨)
         self._action_area = QWidget(self)
-        self._action_layout = QHBoxLayout(self._action_area)
-        self._action_layout.setContentsMargins(12, 0, 12, 8)
+        self._action_area.setObjectName("ActionArea")
+        self._action_area.setStyleSheet(
+            "#ActionArea { background: #fcf0e9; border: 1px solid #c4623c; "
+            "border-radius: 4px; }"
+            "#ActionArea QPushButton { padding: 8px 14px; font-size: 12px; "
+            "font-weight: 600; border-radius: 3px; min-height: 28px; }"
+        )
+        action_outer = QVBoxLayout(self._action_area)
+        action_outer.setContentsMargins(12, 8, 12, 8)
+        action_outer.setSpacing(4)
+
+        action_header = QLabel("⚡ 현재 단계 액션")
+        action_header.setStyleSheet(
+            "color: #c4623c; font-size: 11px; font-weight: 700; "
+            "letter-spacing: 0.05em;"
+        )
+        action_outer.addWidget(action_header)
+
+        action_row = QWidget()
+        self._action_layout = QHBoxLayout(action_row)
+        self._action_layout.setContentsMargins(0, 0, 0, 0)
+        self._action_layout.setSpacing(8)
+        action_outer.addWidget(action_row)
 
         self._stages_container = QWidget(self)
         self._stages_layout = QVBoxLayout(self._stages_container)
@@ -88,7 +110,8 @@ class PipelineDetailWidget(QWidget):
         scroll.setStyleSheet("QScrollArea { border: none; }")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(8, 0, 8, 0)
+        layout.setSpacing(8)
         layout.addWidget(self._title)
         layout.addWidget(self._action_area)
         layout.addWidget(scroll)
