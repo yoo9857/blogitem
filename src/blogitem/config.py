@@ -63,6 +63,13 @@ class Settings(BaseSettings):
     orchestrator_enabled: bool = False
     orchestrator_interval_min: int = Field(default=5, ge=1, le=120)
 
+    # ── ChatGPT 웹 이미지 연동 (P10) ───────────────────────────────────────
+    # 사용자가 ChatGPT 웹에서 만든 이미지를 다운로드하면 blogitem 이 자동 감지.
+    # image_watch_dir — 감시할 폴더 (빈 값이면 ~/Downloads 자동 사용).
+    # image_watch_window_min — 최근 N분 내 수정된 이미지만 후보로 표시.
+    image_watch_dir: str = ""
+    image_watch_window_min: int = Field(default=120, ge=5, le=1440)
+
     # ── P6: 메일 발행 폴백 ────────────────────────────────────────────────
     smtp_host: str = ""
     smtp_port: int = Field(default=587, ge=1, le=65535)

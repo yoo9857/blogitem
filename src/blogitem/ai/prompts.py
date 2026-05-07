@@ -111,6 +111,85 @@ class PromptLibrary:
         )
         return system, user
 
+    # ── 2단계 보조: 이미지 프롬프트 생성 (Claude → 사용자 → ChatGPT 웹) ─────
+
+    def image_prompts(
+        self,
+        *,
+        lecture_meta: dict[str, object],
+        series_topic: str | None = None,
+        body_image_count: int = 3,
+    ) -> tuple[str, str]:
+        """강의별 이미지 프롬프트 N+1 개 생성 (썸네일 1 + 본문 중요 부분 N).
+
+        사용자는 결과 프롬프트를 ChatGPT 웹에 붙여넣어 이미지 생성 후 다운로드.
+        blogitem 의 워치 폴더가 자동 감지 → 임포트.
+
+        Args:
+            lecture_meta: 1단계 산출물의 lecture 객체 (title/summary/key_concepts).
+            series_topic: 시리즈 전체 주제.
+            body_image_count: 본문 중간에 들어갈 이미지 수 (기본 3, 권장 2~5).
+
+        Returns:
+            (system, user). user 출력은 순수 JSON — 프롬프트 N+1 개 배열.
+        """
+        system = (
+            "당신은 한국어 블로그용 시각자료를 설계하는 시니어 디자이너입니다. "
+            "강의 1편에 들어갈 이미지 프롬프트를 작성합니다 — 사용자가 ChatGPT 웹에 "
+            "붙여넣어 이미지를 생성하기 위한 영문/한국어 혼용 프롬프트.\n"
+            "\n"
+            "원칙:\n"
+            "- 썸네일 1장: 강의 전체를 대표 — 제목 + 핵심 개념 시각화\n"
+            "- 본문 이미지 N장: 본문에서 다룰 핵심 포인트별로 1장씩\n"
+            "- 한 강의 안에서 이미지들이 시각적으로 일관 (같은 색감/스타일/구도)\n"
+            "- 텍스트는 영어 키워드 1~2개만 (한국어 텍스트는 깨질 수 있음)\n"
+            "- 1024x1024 정사각형 권장 (블로그 본문 폭에 적합)\n"
+            "- 스타일: Editorial illustration / 미니멀 / 차분한 채도 (cream / ink / terracotta)\n"
+            "\n"
+            "출력 형식: 순수 JSON. 코드 블록(```)이나 설명 텍스트 없이 JSON 만."
+        )
+
+        schema_example = {
+            "style_guide": "한 강의 내 이미지들의 공통 시각 스타일 (1-2 문장)",
+            "images": [
+                {
+                    "role": "thumbnail",
+                    "position": 0,
+                    "purpose": "왜 이 이미지가 필요한가 (1 문장)",
+                    "prompt": (
+                        "ChatGPT 에 붙여넣을 영문/한국어 혼용 프롬프트. "
+                        "구도·요소·텍스트키워드·스타일 모두 포함."
+                    ),
+                },
+                {
+                    "role": "body",
+                    "position": 1,
+                    "purpose": "본문 1번 위치 — 어떤 개념을 시각화하는가",
+                    "prompt": "...",
+                },
+            ],
+        }
+        schema_str = json.dumps(schema_example, ensure_ascii=False, indent=2)
+
+        meta_str = json.dumps(lecture_meta, ensure_ascii=False, indent=2)
+        n_body = max(1, min(5, body_image_count))
+        total = n_body + 1  # +1 thumbnail
+
+        topic_line = f"시리즈 주제: {series_topic}\n" if series_topic else ""
+
+        user = (
+            f"{topic_line}"
+            f"강의 메타:\n{meta_str}\n"
+            f"\n"
+            f"위 강의에 어울리는 이미지 프롬프트를 다음 JSON 스키마로 작성:\n"
+            f"\n"
+            f"{schema_str}\n"
+            f"\n"
+            f"`images` 배열에 정확히 {total}개 — 썸네일 1개 (role=thumbnail, position=0) "
+            f"+ 본문 {n_body}개 (role=body, position=1..{n_body})."
+        )
+        return system, user
+
     # ── 6단계: 게시 (네이버 블로그 HTML) ──────────────────────────────────────
 
     def publish(

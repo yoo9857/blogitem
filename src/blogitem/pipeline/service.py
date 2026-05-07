@@ -240,6 +240,111 @@ class PipelineService:
         )
 
     # ─────────────────────────────────────────────────────────────────────
+    # 2단계 보조 — 이미지 프롬프트 생성 (Claude → 사용자 → ChatGPT 웹)
+    # ─────────────────────────────────────────────────────────────────────
+
+    def generate_image_prompts(
+        self,
+        pipeline_id: int,
+        *,
+        llm: LlmClient,
+        prompt_lib: PromptLibrary,
+        artifact_store: ArtifactStore,
+        body_image_count: int = 3,
+        model: str | None = None,
+        on_line: object = None,
+    ) -> ArtifactRecord:
+        """현재 IMAGE 단계 파이프라인에 대해 Claude 가 이미지 프롬프트 N+1개 생성.
+
+        파이프라인 상태 변경 X — 프롬프트는 별도 artifact (kind="image_prompts")
+        로 저장. 사용자가 ChatGPT 웹에서 이미지 생성 후 ``ingest_image`` 로 임포트.
+        """
+        self._assert_stage(pipeline_id, Stage.IMAGE, Status.AWAITING_INPUT)
+
+        # TOPIC 산출물에서 lecture_meta + series 주제 추출
+        with self._sf() as s:
+            stmt = (
+                select(Pipeline, Series.topic)
+                .outerjoin(Series, Pipeline.series_id == Series.id)
+                .where(Pipeline.id == pipeline_id)
+            )
+            row = s.execute(stmt).first()
+            if row is None:
+                raise ValueError(f"pipeline {pipeline_id} not found")
+            p, series_topic = row
+            position = int(p.position)
+
+            topic_artifact = self._latest_artifact(s, pipeline_id, Stage.TOPIC, "text")
+            if topic_artifact is None:
+                raise RuntimeError("TOPIC 산출물이 없음 — 1단계 먼저 실행")
+
+        topic_path = artifact_store.absolute_path(topic_artifact.path)
+        try:
+            curriculum = json.loads(topic_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as e:
+            raise RuntimeError(f"커리큘럼 JSON 파싱 실패: {e}") from e
+
+        lectures = curriculum.get("lectures") or []
+        idx = position - 1
+        if not (0 <= idx < len(lectures)) or not isinstance(lectures[idx], dict):
+            raise RuntimeError(
+                f"커리큘럼에 position={position} 강의 메타 없음"
+            )
+        lecture_meta = lectures[idx]
+
+        system, user = prompt_lib.image_prompts(
+            lecture_meta=lecture_meta,
+            series_topic=str(series_topic) if series_topic else None,
+            body_image_count=body_image_count,
+        )
+        response = llm.complete(
+            system=system, user=user, model=model, on_line=on_line
+        )
+
+        # JSON artifact 저장 + DB 메타 (kind="image_prompts" — 일반 텍스트와 구분)
+        record = artifact_store.save_text(
+            pipeline_id=pipeline_id,
+            stage=Stage.IMAGE,
+            text=response.text,
+            ext=".json",
+        )
+        with self._sf() as s:
+            s.add(
+                Artifact(
+                    pipeline_id=pipeline_id,
+                    stage=Stage.IMAGE,
+                    kind="image_prompts",
+                    path=record.rel_path,
+                    sha256=record.sha256,
+                    size=record.size,
+                    mime="application/json; charset=utf-8",
+                )
+            )
+            s.commit()
+        return record
+
+    def read_image_prompts(
+        self,
+        pipeline_id: int,
+        *,
+        artifact_store: ArtifactStore,
+    ) -> dict[str, object] | None:
+        """저장된 이미지 프롬프트 JSON 을 dict 로 반환. 없으면 None."""
+        with self._sf() as s:
+            artifact = self._latest_artifact(
+                s, pipeline_id, Stage.IMAGE, "image_prompts"
+            )
+            rel_path = artifact.path if artifact else None
+        if rel_path is None:
+            return None
+        try:
+            text = artifact_store.absolute_path(rel_path).read_text(encoding="utf-8")
+            data = json.loads(text)
+            return data if isinstance(data, dict) else None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    # ─────────────────────────────────────────────────────────────────────
     # 2단계 — IMAGE (사용자 업로드)
     # ─────────────────────────────────────────────────────────────────────
 

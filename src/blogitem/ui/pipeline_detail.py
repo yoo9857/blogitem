@@ -147,10 +147,28 @@ class PipelineDetailWidget(QWidget):
             self._action_layout.addWidget(btn)
 
         elif stage == Stage.IMAGE and status == Status.AWAITING_INPUT:
+            prompts_btn = QPushButton("🎨 프롬프트 생성 (Claude)")
+            prompts_btn.setToolTip(
+                "Claude 가 강의 메타를 분석해 썸네일 + 본문 이미지 프롬프트 생성. "
+                "결과를 ChatGPT 에 붙여넣어 이미지 만들기."
+            )
+            prompts_btn.clicked.connect(lambda: self._gen_image_prompts(dto.id))
+
+            import_btn = QPushButton("📥 다운로드 임포트")
+            import_btn.setToolTip(
+                "ChatGPT 에서 다운받은 이미지를 폴더에서 직접 임포트. "
+                "썸네일 + 메타 표시 + 다중 선택."
+            )
+            import_btn.clicked.connect(lambda: self._import_from_watch(dto.id))
+
             upload_btn = QPushButton("이미지 업로드…")
             upload_btn.clicked.connect(lambda: self._upload_image(dto.id))
+
             advance_btn = QPushButton("다음 단계로 →")
             advance_btn.clicked.connect(lambda: self._advance_image(dto.id))
+
+            self._action_layout.addWidget(prompts_btn)
+            self._action_layout.addWidget(import_btn)
             self._action_layout.addWidget(upload_btn)
             self._action_layout.addWidget(advance_btn)
 
@@ -219,6 +237,97 @@ class PipelineDetailWidget(QWidget):
 
     def _on_auto_fail(self, pipeline_id: int, message: str) -> None:
         QMessageBox.critical(self, "단계 실패", message)
+        self.show_pipeline(pipeline_id)
+        self.pipeline_changed.emit(pipeline_id)
+
+    # ── 이미지 프롬프트 생성 (Claude — 2단계 보조) ───────────────────────────
+
+    def _gen_image_prompts(self, pipeline_id: int) -> None:
+        from blogitem.ui.image_prompts_dialog import ImagePromptsDialog
+        from blogitem.ui.workers.image_prompts_worker import ImagePromptsWorker
+
+        progress = QProgressDialog(
+            "Claude — 이미지 프롬프트 생성 중…",
+            "취소",
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle("프롬프트 생성")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+
+        worker = ImagePromptsWorker(
+            pipeline_id=pipeline_id,
+            service=self._service,
+            settings=self._settings,
+            body_image_count=3,
+            parent=self,
+        )
+        worker.line_received.connect(self.output_line.emit)
+
+        def on_ok(pid: int, data: dict) -> None:
+            progress.close()
+            dlg = ImagePromptsDialog(prompts_data=data, parent=self)
+            dlg.exec()
+
+        def on_fail(pid: int, msg: str) -> None:
+            progress.close()
+            QMessageBox.critical(self, "프롬프트 생성 실패", msg)
+
+        worker.finished_ok.connect(on_ok)
+        worker.failed.connect(on_fail)
+        progress.canceled.connect(worker.requestInterruption)
+
+        worker.start()
+        progress.exec()
+
+    def _import_from_watch(self, pipeline_id: int) -> None:
+        from blogitem.image.watcher import list_recent_images, resolve_watch_dir
+        from blogitem.pipeline.artifacts import ArtifactStore
+        from blogitem.ui.image_import_dialog import ImageImportDialog
+
+        watch_dir = resolve_watch_dir(self._settings.image_watch_dir)
+        window_min = self._settings.image_watch_window_min
+
+        paths = list_recent_images(watch_dir=watch_dir, max_age_min=window_min)
+
+        dlg = ImageImportDialog(
+            watch_dir=watch_dir,
+            initial_paths=paths,
+            parent=self,
+        )
+        # 새로고침 — 같은 watch_dir 다시 스캔
+        dlg.refresh_requested.connect(
+            lambda: dlg.set_paths(
+                list_recent_images(watch_dir=watch_dir, max_age_min=window_min)
+            )
+        )
+
+        if dlg.exec() != ImageImportDialog.DialogCode.Accepted:
+            return
+
+        selected = dlg.selected_paths
+        if not selected:
+            return
+
+        store = ArtifactStore(self._settings.artifacts_dir)
+        errors: list[str] = []
+        ok_count = 0
+        for path in selected:
+            try:
+                self._service.ingest_image(
+                    pipeline_id, source_path=path, artifact_store=store
+                )
+                ok_count += 1
+            except Exception as e:  # noqa: BLE001
+                errors.append(f"{path.name}: {type(e).__name__}: {e}")
+
+        msg = f"{ok_count}/{len(selected)} 이미지 임포트"
+        if errors:
+            msg += "\n\n실패:\n" + "\n".join(errors)
+        QMessageBox.information(self, "임포트 결과", msg)
+
         self.show_pipeline(pipeline_id)
         self.pipeline_changed.emit(pipeline_id)
 
