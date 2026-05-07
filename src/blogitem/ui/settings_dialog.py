@@ -37,6 +37,7 @@ class SettingsDialog(QDialog):
         self._oauth_progress: QProgressDialog | None = None
 
         tabs = QTabWidget(self)
+        tabs.addTab(self._build_llm_tab(), "LLM")
         tabs.addTab(self._build_anthropic_tab(), "Anthropic")
         tabs.addTab(self._build_naver_tab(), "네이버")
 
@@ -52,6 +53,60 @@ class SettingsDialog(QDialog):
         layout.addWidget(buttons)
 
     # ── Tabs ────────────────────────────────────────────────────────────────
+
+    def _build_llm_tab(self) -> QWidget:
+        """LLM 백엔드 모드 + 설치된 CLI 검출 표시."""
+        from blogitem.ai.cli_client import find_cli
+        from blogitem.config import load_settings
+
+        w = QWidget(self)
+        form = QFormLayout(w)
+        settings = load_settings()
+
+        # 현재 모드
+        mode_label = QLabel(f"<b>{settings.llm_mode}</b>")
+        form.addRow("현재 모드:", mode_label)
+
+        # CLI 검출
+        claude_path = find_cli("claude")
+        codex_path = find_cli("codex")
+
+        claude_status = (
+            f"✓ <code>{claude_path}</code>" if claude_path else "✗ 설치 안 됨"
+        )
+        codex_status = (
+            f"✓ <code>{codex_path}</code>" if codex_path else "✗ 설치 안 됨"
+        )
+
+        claude_lbl = QLabel(claude_status)
+        claude_lbl.setTextFormat(Qt.TextFormat.RichText)
+        codex_lbl = QLabel(codex_status)
+        codex_lbl.setTextFormat(Qt.TextFormat.RichText)
+
+        form.addRow("claude CLI:", claude_lbl)
+        form.addRow("codex CLI:", codex_lbl)
+
+        # 모델
+        model_value = settings.llm_cli_model or "(CLI 기본)"
+        form.addRow("CLI 모델:", QLabel(model_value))
+        form.addRow("타임아웃:", QLabel(f"{settings.llm_cli_timeout_sec}s"))
+
+        # 변경 안내
+        info = QLabel(
+            "<p>모드 변경: <code>.env</code> 의 <code>BLOGITEM_LLM_MODE</code> 수정 후 앱 재시작.</p>"
+            "<p>허용 값: <code>api</code> · <code>claude_cli</code> · <code>codex_cli</code></p>"
+            "<p><b>인증 사전 요구</b> — 사용 전 한 번 인증 필요:</p>"
+            "<ul>"
+            "<li><code>claude</code> — Max 구독으로 사용 시 <code>claude /login</code> "
+            "(또는 API 키 환경변수)</li>"
+            "<li><code>codex</code> — ChatGPT Plus 로 사용 시 <code>codex login</code></li>"
+            "</ul>"
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #4a4742; font-size: 12px;")
+        form.addRow(info)
+
+        return w
 
     def _build_anthropic_tab(self) -> QWidget:
         w = QWidget(self)

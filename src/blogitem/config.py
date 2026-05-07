@@ -48,6 +48,14 @@ class Settings(BaseSettings):
     claude_model_primary: str = "claude-opus-4-7"
     claude_model_fast: str = "claude-haiku-4-5-20251001"
 
+    # ── LLM 모드 ───────────────────────────────────────────────────────────
+    # api         — anthropic SDK (API 키 필요, 종량제)
+    # claude_cli  — `claude` CLI subprocess (Claude Max 구독 한도 안 $0)
+    # codex_cli   — `codex` CLI subprocess (ChatGPT Plus 구독 한도 안 $0)
+    llm_mode: str = "api"
+    llm_cli_model: str = ""           # 빈 값이면 CLI 기본 모델 사용
+    llm_cli_timeout_sec: int = Field(default=600, ge=30, le=3600)
+
     # ── P6: 메일 발행 폴백 ────────────────────────────────────────────────
     smtp_host: str = ""
     smtp_port: int = Field(default=587, ge=1, le=65535)
