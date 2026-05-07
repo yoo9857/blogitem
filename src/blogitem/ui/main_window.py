@@ -1,6 +1,7 @@
-"""MainWindow — 좌 PipelineList / 우 PipelineDetail.
+"""MainWindow — 좌 PipelineList / 우 PipelineDetail + Watchdog + 알림.
 
-P2 — 시리즈 생성 + 목록·상세 연결. 단계별 액션은 P3+.
+P5 통합 — WatchdogService 가 1시간 간격으로 정체/토큰 만료 감지 →
+상태바 갱신 + 데스크톱 알림.
 """
 
 from __future__ import annotations
@@ -10,6 +11,7 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
+    QLabel,
     QMainWindow,
     QSplitter,
     QStatusBar,
@@ -22,6 +24,7 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session, sessionmaker
 
     from blogitem.config import Settings
+    from blogitem.watchdog.monitor import StuckPipeline
 
 
 class MainWindow(QMainWindow):
@@ -45,6 +48,7 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_central()
         self._build_status_bar()
+        self._start_watchdog()
 
     # ── 메뉴 ────────────────────────────────────────────────────────────────
 
@@ -95,8 +99,9 @@ class MainWindow(QMainWindow):
             service=self._service, settings=self._settings, parent=splitter
         )
         self._list_widget.pipeline_selected.connect(self._detail_widget.show_pipeline)
-        # 상세에서 단계 변경 시 → 목록 재로드 (상태 뱃지 갱신)
-        self._detail_widget.pipeline_changed.connect(lambda _id: self._list_widget.refresh())
+        self._detail_widget.pipeline_changed.connect(
+            lambda _id: self._list_widget.refresh()
+        )
 
         splitter.addWidget(self._list_widget)
         splitter.addWidget(self._detail_widget)
@@ -107,20 +112,75 @@ class MainWindow(QMainWindow):
     # ── 상태바 ──────────────────────────────────────────────────────────────
 
     def _build_status_bar(self) -> None:
-        from PySide6.QtWidgets import QLabel
-
         bar = QStatusBar(self)
-        dry_run_label = QLabel(
+
+        self._dry_run_label = QLabel(
             f"dry_run: {'ON' if self._settings.dry_run else 'OFF'}"
         )
-        dry_run_label.setStyleSheet(
+        self._dry_run_label.setStyleSheet(
             "padding: 0 8px; "
             f"color: {'#c4623c' if self._settings.dry_run else '#063'};"
         )
-        bar.addPermanentWidget(dry_run_label)
-        bar.addPermanentWidget(QLabel("큐: – · 토큰: –"))
+        bar.addPermanentWidget(self._dry_run_label)
+
+        self._queue_label = QLabel("큐: – ")
+        self._token_label = QLabel("토큰: – ")
+        bar.addPermanentWidget(self._queue_label)
+        bar.addPermanentWidget(self._token_label)
+
         self.setStatusBar(bar)
         bar.showMessage("준비됨", 3000)
+
+    # ── Watchdog ────────────────────────────────────────────────────────────
+
+    def _start_watchdog(self) -> None:
+        from blogitem.naver.token_store import TokenStore
+        from blogitem.notify.notifier import Notifier
+        from blogitem.watchdog.monitor import make_watchdog_service
+
+        self._notifier = Notifier()
+        self._watchdog = make_watchdog_service(
+            session_factory=self._session_factory,
+            token_store=TokenStore(),
+            parent=self,
+        )
+        self._watchdog.stuck_found.connect(self._on_stuck_found)
+        self._watchdog.token_expiring.connect(self._on_token_expiring)
+        self._watchdog.queue_summary.connect(self._on_queue_summary)
+        self._watchdog.start(interval_min=60)
+
+    def _on_stuck_found(self, stuck_list: list[StuckPipeline]) -> None:
+        if not stuck_list:
+            return
+        n = len(stuck_list)
+        self._notifier.desktop(
+            title="blogitem · 정체 감지",
+            message=f"{n} 개 파이프라인이 24시간 이상 진행되지 않았습니다.",
+        )
+        self.statusBar().showMessage(
+            f"⚠ {n} 개 파이프라인 정체됨 — 좌측 목록 확인", 10000
+        )
+
+    def _on_token_expiring(self, days: int) -> None:
+        self._notifier.desktop(
+            title="blogitem · 네이버 토큰 만료 임박",
+            message=f"refresh_token 만료까지 {days}일 — [설정] 에서 재인증 권장.",
+        )
+        self._token_label.setText(f"토큰: {days}일")
+        self._token_label.setStyleSheet(
+            f"padding: 0 8px; color: {'#c4623c' if days <= 7 else '#7a756c'};"
+        )
+
+    def _on_queue_summary(self, counts: dict[str, int]) -> None:
+        pending = counts.get("pending", 0) + counts.get("running", 0)
+        awaiting = counts.get("awaiting_input", 0) + counts.get("awaiting_review", 0)
+        failed = counts.get("failed", 0)
+        text = f"큐: 진행 {pending} · 대기 {awaiting} · 실패 {failed}"
+        if failed > 0:
+            self._queue_label.setStyleSheet("padding: 0 8px; color: #c4623c;")
+        else:
+            self._queue_label.setStyleSheet("padding: 0 8px; color: #4a4742;")
+        self._queue_label.setText(text)
 
     # ── 액션 ────────────────────────────────────────────────────────────────
 
@@ -159,3 +219,13 @@ class MainWindow(QMainWindow):
             f"<p><a href='https://github.com/yoo9857/blogitem'>"
             f"github.com/yoo9857/blogitem</a></p>",
         )
+
+    # ── 종료 처리 ───────────────────────────────────────────────────────────
+
+    def closeEvent(self, event: object) -> None:  # noqa: N802
+        if hasattr(self, "_watchdog"):
+            try:
+                self._watchdog.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        super().closeEvent(event)  # type: ignore[arg-type]

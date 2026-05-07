@@ -1,8 +1,8 @@
 """런타임 설정 — env + .env 로드, pydantic 검증.
 
-시크릿(API 키, OAuth client_secret)은 여기에 두지 않는다.
+시크릿(API 키, OAuth client_secret, SMTP 비밀번호)은 여기에 두지 않는다.
 ``blogitem.secrets`` 의 keyring 래퍼를 사용하며, ``.env`` 는 비-시크릿 운영
-옵션(DB 경로, 로그 레벨, OAuth 콜백 호스트/포트, 모델 ID)만 담는다.
+옵션(DB 경로, 로그 레벨, OAuth 콜백 호스트/포트, 모델 ID, SMTP 서버)만.
 """
 
 from __future__ import annotations
@@ -47,6 +47,13 @@ class Settings(BaseSettings):
     # Claude 모델 (anthropic SDK)
     claude_model_primary: str = "claude-opus-4-7"
     claude_model_fast: str = "claude-haiku-4-5-20251001"
+
+    # ── P6: 메일 발행 폴백 ────────────────────────────────────────────────
+    smtp_host: str = ""
+    smtp_port: int = Field(default=587, ge=1, le=65535)
+    smtp_use_tls: bool = True
+    smtp_from: str = ""
+    naver_publish_email: str = ""
 
 
 def load_settings() -> Settings:
