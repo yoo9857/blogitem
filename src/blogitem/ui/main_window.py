@@ -91,8 +91,12 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
 
         self._list_widget = PipelineListWidget(service=self._service, parent=splitter)
-        self._detail_widget = PipelineDetailWidget(service=self._service, parent=splitter)
+        self._detail_widget = PipelineDetailWidget(
+            service=self._service, settings=self._settings, parent=splitter
+        )
         self._list_widget.pipeline_selected.connect(self._detail_widget.show_pipeline)
+        # 상세에서 단계 변경 시 → 목록 재로드 (상태 뱃지 갱신)
+        self._detail_widget.pipeline_changed.connect(lambda _id: self._list_widget.refresh())
 
         splitter.addWidget(self._list_widget)
         splitter.addWidget(self._detail_widget)

@@ -48,3 +48,18 @@ class ArtifactRecord:
     sha256: str
     size: int
     mime: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class StageRunResult:
+    """자동 단계 실행 결과 — UI 알림용."""
+
+    pipeline_id: int
+    stage: Stage
+    success: bool
+    artifact_rel_path: str | None
+    next_stage: Stage | None
+    next_status: Status | None
+    error: str | None
+    input_tokens: int = 0
+    output_tokens: int = 0
