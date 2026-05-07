@@ -1,6 +1,6 @@
-"""MainWindow — 좌측 파이프라인 목록 / 우측 단계별 상세.
+"""MainWindow — 좌 PipelineList / 우 PipelineDetail.
 
-P0 — 골격만 (Splitter + StatusBar + 메뉴). 실제 파이프라인 위젯은 P2.
+P2 — 시리즈 생성 + 목록·상세 연결. 단계별 액션은 P3+.
 """
 
 from __future__ import annotations
@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
-    QLabel,
     QMainWindow,
     QSplitter,
     QStatusBar,
-    QVBoxLayout,
     QWidget,
 )
+
+from blogitem.pipeline.service import PipelineService
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session, sessionmaker
@@ -25,14 +25,7 @@ if TYPE_CHECKING:
 
 
 class MainWindow(QMainWindow):
-    """blogitem 메인 윈도우.
-
-    레이아웃:
-        ``QSplitter(Horizontal)``
-          ├ 좌: PipelineList (P2)
-          └ 우: PipelineDetail (P2)
-        ``QStatusBar`` — dry_run / 큐 상태 / 토큰 만료 일수 (P5).
-    """
+    """blogitem 메인 윈도우."""
 
     def __init__(
         self,
@@ -44,6 +37,7 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self._settings = settings
         self._session_factory = session_factory
+        self._service = PipelineService(session_factory)
 
         self.setWindowTitle("blogitem")
         self.resize(1100, 720)
@@ -61,9 +55,13 @@ class MainWindow(QMainWindow):
 
         new_series = QAction("새 시리즈…", self)
         new_series.setShortcut(QKeySequence.StandardKey.New)
-        new_series.setStatusTip("새 강의/시리즈 생성 (P2 — 구현 예정)")
-        new_series.setEnabled(False)
+        new_series.triggered.connect(self._open_new_series)
         file_menu.addAction(new_series)
+
+        refresh = QAction("새로고침", self)
+        refresh.setShortcut("F5")
+        refresh.triggered.connect(self._refresh_list)
+        file_menu.addAction(refresh)
 
         file_menu.addSeparator()
 
@@ -86,38 +84,28 @@ class MainWindow(QMainWindow):
     # ── 본문 ────────────────────────────────────────────────────────────────
 
     def _build_central(self) -> None:
+        from blogitem.ui.pipeline_detail import PipelineDetailWidget
+        from blogitem.ui.pipeline_list import PipelineListWidget
+
         splitter = QSplitter(Qt.Orientation.Horizontal, self)
         splitter.setChildrenCollapsible(False)
 
-        # 좌측 — 파이프라인 목록 자리 (P2)
-        left = QWidget(splitter)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(12, 12, 12, 12)
-        placeholder_left = QLabel("Pipelines\n\n(P2 — PipelineList 위젯 자리)")
-        placeholder_left.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder_left.setStyleSheet("color: #888; font-size: 13px;")
-        left_layout.addWidget(placeholder_left)
+        self._list_widget = PipelineListWidget(service=self._service, parent=splitter)
+        self._detail_widget = PipelineDetailWidget(service=self._service, parent=splitter)
+        self._list_widget.pipeline_selected.connect(self._detail_widget.show_pipeline)
 
-        # 우측 — 파이프라인 상세 자리 (P2)
-        right = QWidget(splitter)
-        right_layout = QVBoxLayout(right)
-        right_layout.setContentsMargins(16, 16, 16, 16)
-        placeholder_right = QLabel("Pipeline Detail\n\n(P2 — 단계별 상태 카드 자리)")
-        placeholder_right.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        placeholder_right.setStyleSheet("color: #888; font-size: 13px;")
-        right_layout.addWidget(placeholder_right)
-
-        splitter.addWidget(left)
-        splitter.addWidget(right)
-        splitter.setSizes([320, 780])
+        splitter.addWidget(self._list_widget)
+        splitter.addWidget(self._detail_widget)
+        splitter.setSizes([340, 760])
 
         self.setCentralWidget(splitter)
 
     # ── 상태바 ──────────────────────────────────────────────────────────────
 
     def _build_status_bar(self) -> None:
-        bar = QStatusBar(self)
+        from PySide6.QtWidgets import QLabel
 
+        bar = QStatusBar(self)
         dry_run_label = QLabel(
             f"dry_run: {'ON' if self._settings.dry_run else 'OFF'}"
         )
@@ -126,14 +114,26 @@ class MainWindow(QMainWindow):
             f"color: {'#c4623c' if self._settings.dry_run else '#063'};"
         )
         bar.addPermanentWidget(dry_run_label)
-
-        # 큐/토큰 메트릭은 P5 에서 채움 (Watchdog 연결).
         bar.addPermanentWidget(QLabel("큐: – · 토큰: –"))
-
         self.setStatusBar(bar)
         bar.showMessage("준비됨", 3000)
 
     # ── 액션 ────────────────────────────────────────────────────────────────
+
+    def _open_new_series(self) -> None:
+        from blogitem.ui.new_series_dialog import NewSeriesDialog
+
+        dlg = NewSeriesDialog(service=self._service, parent=self)
+        if dlg.exec() == NewSeriesDialog.DialogCode.Accepted and dlg.created is not None:
+            created = dlg.created
+            self._refresh_list()
+            self.statusBar().showMessage(
+                f"시리즈 #{created.id} 생성 — {created.pipeline_count}개 파이프라인",
+                5000,
+            )
+
+    def _refresh_list(self) -> None:
+        self._list_widget.refresh()
 
     def _open_settings(self) -> None:
         from blogitem.ui.settings_dialog import SettingsDialog
