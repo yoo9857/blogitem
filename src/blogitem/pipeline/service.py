@@ -278,8 +278,10 @@ class PipelineService:
         """
         topic_text = self._begin_auto_stage(pipeline_id, expected=Stage.TOPIC)
 
-        # 시리즈 outline 재사용 가능 여부 검사
-        existing_outline = self._existing_series_outline(pipeline_id)
+        # 시리즈 outline 재사용 가능 여부 검사 (siblings artifact backfill 포함)
+        existing_outline = self._existing_series_outline(
+            pipeline_id, artifact_store=artifact_store
+        )
         if existing_outline is not None:
             # 캐시 히트 — Claude 호출 없이 즉시 산출물 저장
             record = artifact_store.save_text(
@@ -336,8 +338,19 @@ class PipelineService:
             output_tokens=response.output_tokens,
         )
 
-    def _existing_series_outline(self, pipeline_id: int) -> str | None:
-        """파이프라인이 속한 시리즈에 이미 저장된 ``outline`` 반환. 없으면 None."""
+    def _existing_series_outline(
+        self,
+        pipeline_id: int,
+        *,
+        artifact_store: ArtifactStore | None = None,
+    ) -> str | None:
+        """파이프라인이 속한 시리즈의 캐시된 ``outline`` 반환. 없으면 None.
+
+        2 단계 lookup:
+            1. ``Series.outline`` (빠른 경로 — 현 버전 코드가 저장한 값).
+            2. 형제 파이프라인의 TOPIC text artifact (백필 — P14 이전 데이터).
+               찾으면 디스크에서 읽고 ``Series.outline`` 에 저장 (다음엔 빠른 경로).
+        """
         with self._sf() as s:
             p = s.get(Pipeline, pipeline_id)
             if p is None or p.series_id is None:
@@ -345,8 +358,38 @@ class PipelineService:
             series = s.get(Series, p.series_id)
             if series is None:
                 return None
-            outline = series.outline
-            return outline if outline else None
+            if series.outline:
+                return series.outline
+            # 폴백 — 형제 파이프라인의 기존 TOPIC artifact 활용 (백필)
+            if artifact_store is None:
+                return None
+            sibling_artifact = s.execute(
+                select(Artifact)
+                .join(Pipeline, Pipeline.id == Artifact.pipeline_id)
+                .where(
+                    Pipeline.series_id == p.series_id,
+                    Pipeline.id != pipeline_id,
+                    Artifact.stage == Stage.TOPIC,
+                    Artifact.kind == "text",
+                )
+                .order_by(Artifact.id.asc())
+                .limit(1)
+            ).scalar_one_or_none()
+            if sibling_artifact is None:
+                return None
+            sibling_rel_path = sibling_artifact.path
+
+        # 세션 외부에서 디스크 읽기 — IO 가 트랜잭션 잡지 않게
+        try:
+            text = artifact_store.absolute_path(sibling_rel_path).read_text(
+                encoding="utf-8"
+            )
+        except (OSError, UnicodeDecodeError):
+            return None
+
+        # 백필 — 다음번엔 형제 검색 없이 빠른 경로
+        self._save_series_outline(pipeline_id, text)
+        return text
 
     def _save_series_outline(self, pipeline_id: int, outline_text: str) -> None:
         """``Series.outline`` 에 커리큘럼 저장. 시리즈 없는 파이프라인은 무시."""

@@ -263,6 +263,54 @@ class TestSeriesCurriculumSharing:
         service.run_topic_stage(p2.id, llm=llm, prompt_lib=prompt_lib, artifact_store=artifact_store)
         assert llm.complete.call_count == 2  # 각자 호출
 
+    def test_backfill_from_sibling_artifact(
+        self,
+        service: PipelineService,
+        artifact_store: ArtifactStore,
+        prompt_lib: MagicMock,
+        session_factory: sessionmaker[Session],
+    ) -> None:
+        """P14 이전 데이터 호환 — series.outline 비어있어도 형제 파이프라인의
+        TOPIC artifact 가 있으면 그것을 재사용 (Claude 호출 X)."""
+        from blogitem.pipeline.models import Series
+
+        service.create_series_with_pipelines(topic="legacy", lecture_count=3)
+        pipelines = sorted(service.list_pipelines(), key=lambda p: p.position)
+        first, second = pipelines[0], pipelines[1]
+
+        # 첫 파이프라인을 정상 실행 → outline 도 자동 저장됨
+        service.run_topic_stage(
+            first.id,
+            llm=_success_llm(text='{"series_title":"legacy curriculum"}'),
+            prompt_lib=prompt_lib,
+            artifact_store=artifact_store,
+        )
+
+        # 시뮬레이션 — series.outline 을 비워서 P14 이전 상태 재현
+        # (다른 파이프라인의 artifact 만 남아있는 상황)
+        with session_factory() as s:
+            srows = s.query(Series).all()
+            for srow in srows:
+                srow.outline = None
+            s.commit()
+
+        # 두 번째 파이프라인 실행 → 형제 artifact 발견 → 백필 + 재사용
+        llm = _success_llm()
+        result = service.run_topic_stage(
+            second.id,
+            llm=llm,
+            prompt_lib=prompt_lib,
+            artifact_store=artifact_store,
+        )
+        assert llm.complete.call_count == 0  # Claude 호출 X
+        assert result.success is True
+
+        # series.outline 이 다시 채워졌는지 (백필 효과)
+        with session_factory() as s:
+            srow = s.query(Series).first()
+            assert srow is not None
+            assert srow.outline == '{"series_title":"legacy curriculum"}'
+
 
 # ── 실패 케이스 ────────────────────────────────────────────────────────────────
 
